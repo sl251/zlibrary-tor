@@ -1,37 +1,35 @@
 # zlibrary-tor
 
-可移植的 Agent 技能 + JSON CLI：通过本地 Tor SOCKS 代理访问 Z-Library 的 onion E-API，完成搜索与下载。兼容 Claude Code、Codex CLI、Hermes Agent 以及任何加载 [SKILL.md](SKILL.md) 格式技能的 agent。
+一个给 AI agent 用的 Z-Library 技能：让 agent 通过本机 Tor 代理连 Z-Library 的 onion 站，帮你搜书、下书。命令行输出全是 JSON，agent 拿到就能直接解析，不用抓网页。
+
+适用于 Claude Code、Codex CLI、Hermes Agent，以及其他支持 SKILL.md 格式技能的 agent。
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-## 为什么做这个
+## 先装好这两样
 
-- **JSON 优先**：所有命令输出 JSON，agent 可以确定性解析结果——不抓 HTML、不依赖脆弱的选择器。
-- **只走 Tor**：CLI 通过 SOCKS5 Tor 监听访问 v3 onion 服务，默认拒绝明网和内网目标。
-- **密码卫生**：密码只经 `getpass` 隐藏提示输入，用完即弃，绝不落盘、不进日志。磁盘上只存 `remix_userid` / `remix_userkey` 会话值（chmod 600）。
-- **边界内建**：v3 onion 地址校验、重定向上限、下载大小封顶、无 cookie jar、无代理回退。
+1. 本机跑一个 Tor，开 SOCKS5 监听 `127.0.0.1:9050`。最简单的办法：装个 Tor Browser，它自带的 Tor 就行。
+2. 把仓库克隆到你 agent 的技能目录：
 
-## 作为 Agent 技能安装
-
-克隆到你所用 agent 的技能目录：
-
-| Agent | 路径 |
+| Agent | 克隆到 |
 |---|---|
 | Claude Code | `~/.claude/skills/zlibrary-tor` |
 | Codex CLI | `~/.codex/skills/zlibrary-tor` |
 | Hermes Agent | `~/.hermes/skills/zlibrary-tor` |
-| 自定义 | 任意位置——直接调用 `scripts/zlibrary_tor.py` |
+| 其他 | 随便放哪，直接调 `scripts/zlibrary_tor.py` |
 
 ```bash
 git clone https://github.com/sl251/zlibrary-tor.git ~/.claude/skills/zlibrary-tor
 python -m pip install -r ~/.claude/skills/zlibrary-tor/scripts/requirements.txt
 ```
 
-先让 Tor 在 `127.0.0.1:9050` 起一个 SOCKS5 监听（Tor Browser 自带的 Tor 就行），然后验证链路：
+装完先跑一句 `doctor`，确认 Tor 和 Z-Library 都通：
 
 ```bash
 python ~/.claude/skills/zlibrary-tor/scripts/zlibrary_tor.py doctor
 ```
+
+输出这样就是通了：
 
 ```json
 {
@@ -39,31 +37,33 @@ python ~/.claude/skills/zlibrary-tor/scripts/zlibrary_tor.py doctor
   "base_url": "http://loginzlib2vrak5zzpcocc3ouizykn6k5qecgj2tzlnab5wcbqhembyd.onion",
   "proxy": "configured",
   "authenticated": false,
-  "api_success": true
+  "api_success": 1
 }
 ```
 
-Agent 工作流见 [SKILL.md](SKILL.md)，账号注册与会话处理规则见 [references/accounts.md](references/accounts.md)。
+装好后直接对 agent 说「帮我搜一下三体」就行，它会照着 [SKILL.md](SKILL.md) 的流程走。账号注册、登录的事看 [references/accounts.md](references/accounts.md)。
 
-## CLI 命令
+## 命令
 
-所有命令输出 JSON。`doctor` 和 `search` 无需登录，`profile` 和 `download` 需要会话。
+一共 7 条，每条都输出 JSON。`doctor` 和 `search` 不用登录，`profile` 和 `download` 要先登录。
 
-### `doctor` — 验证 Tor + E-API 连通性
+### doctor：检查链路通不通
 
 ```bash
 python scripts/zlibrary_tor.py doctor
 ```
 
-### `login` — 交互式登录（隐藏密码输入）
+### login：登录（交互式，密码不回显）
 
 ```bash
 python scripts/zlibrary_tor.py login --email you@example.com
 ```
 
-会话保存在配置文件里（默认 `~/.config/zlibrary-tor/config.json`，可用 `ZLIBRARY_TOR_CONFIG` 覆盖）。已经在 Tor Browser 里登录过？用 `import-session` 粘贴已有的 `remix_userid` / `remix_userkey` 即可。
+输密码时屏幕上不显示，密码也不会存到任何文件。存下来的只有会话凭证（`remix_userid` / `remix_userkey`），默认放在 `~/.config/zlibrary-tor/config.json`，可以用环境变量 `ZLIBRARY_TOR_CONFIG` 换位置。
 
-### `profile` — 账号信息与下载配额
+如果你已经在 Tor Browser 里登录过 Z-Library，不想再输一遍密码，用 `import-session` 把浏览器里的那两个 remix 值粘进来就行。
+
+### profile：看账号信息和今日下载额度
 
 ```bash
 python scripts/zlibrary_tor.py profile
@@ -71,9 +71,9 @@ python scripts/zlibrary_tor.py profile
 
 ```json
 {
-  "success": true,
+  "success": 1,
   "user": {
-    "id": "41934710",
+    "id": 12345678,
     "email": "you@example.com",
     "downloads_today": 0,
     "downloads_limit": 10
@@ -81,7 +81,7 @@ python scripts/zlibrary_tor.py profile
 }
 ```
 
-### `search` — 搜索书籍
+### search：搜书
 
 ```bash
 python scripts/zlibrary_tor.py search "三体" --limit 5 --language chinese
@@ -93,56 +93,60 @@ python scripts/zlibrary_tor.py search "三体" --limit 5 --language chinese
   "count": 5,
   "books": [
     {
-      "id": "123456789",
-      "hash": "abcdef0123456789abcdef",
+      "id": 26610712,
+      "hash": "def1ec",
       "title": "三体",
       "author": "刘慈欣",
-      "year": "2008",
-      "language": "chinese",
+      "year": 2008,
+      "language": "Chinese",
       "extension": "epub",
-      "filesizeString": "2.1 MB"
+      "filesizeString": "2.48 MB"
     }
   ]
 }
 ```
 
-### `download` — 下载选中的书
+（示例只贴了第一条，实际会返回 5 条；书名、id 都是真实数据。）支持 `--language`（按语言过滤）、`--extension`（按格式过滤，如 epub、pdf）、`--limit`（最多 20）。
+
+### download：下书
 
 ```bash
-python scripts/zlibrary_tor.py download --id 123456789 --hash abcdef0123456789abcdef
+python scripts/zlibrary_tor.py download --id 26610712 --hash def1ec
 ```
 
 ```json
 {
   "ok": true,
-  "path": "/abs/path/downloads/三体.epub",
-  "bytes": 2202011
+  "path": "downloads/三体.epub",
+  "bytes": 2598912
 }
 ```
 
-参数：`--output-dir`（默认 `downloads`）、`--max-mb`（默认 80，硬上限 512）。agent 应该先让你从搜索结果里挑一本再下载——见 [SKILL.md](SKILL.md)。
+`--output-dir` 指定保存目录（默认 `downloads`），`--max-mb` 限大小（默认 80 MB，最大 512）。
 
-### `register` — API 注册账号
+正常用法是你从搜索结果里挑一本，agent 拿它对应的 `id` 和 `hash` 去下载。
 
-只在你明确想走 API 注册、且有自己的有效邮箱时使用。推荐的 Tor Browser 注册路径和规则见 [references/accounts.md](references/accounts.md)。
+### register：注册新账号
 
-## 配置
+一般不建议直接用这个，优先在 Tor Browser 里手动注册（有验证码、确认邮件这些步骤，浏览器里处理更稳妥）。确实想走 API 注册再看 [references/accounts.md](references/accounts.md)。
 
-| 环境变量 | 含义 | 默认值 |
+## 环境变量
+
+| 变量 | 干嘛的 | 默认值 |
 |---|---|---|
-| `ZLIBRARY_TOR_CONFIG` | 配置文件路径 | `~/.config/zlibrary-tor/config.json` |
-| `ZLIBRARY_TOR_PROXY` | Tor SOCKS5 代理 | `socks5://127.0.0.1:9050` |
-| `ZLIBRARY_BASE_URL` | E-API 基地址 | 内置 v3 onion 地址 |
+| `ZLIBRARY_TOR_CONFIG` | 配置文件放哪 | `~/.config/zlibrary-tor/config.json` |
+| `ZLIBRARY_TOR_PROXY` | Tor 代理地址 | `socks5://127.0.0.1:9050` |
+| `ZLIBRARY_BASE_URL` | Z-Library 地址 | 内置 onion 地址 |
 
-onion 访问必须走 SOCKS5 Tor 代理——常规 HTTP 代理（如 mihomo/clash）解析不了 `.onion`。如果服务器上的 Tor 需要上游代理，应给 Tor 本身配置 `HTTPSProxy`/`Socks5Proxy`，而不是改这个 CLI 的指向。详见 [references/accounts.md](references/accounts.md#restricted-server-proxy-chain)。
+一个常见的坑：onion 网址必须走 Tor 的 SOCKS5，mihomo/clash 这类普通代理是解析不了 `.onion` 的。如果你的服务器上 Tor 本身需要上游代理，去 Tor 的配置里加 `HTTPSProxy`/`Socks5Proxy`，别把这个 CLI 指到 mihomo 上。
 
-## 安全性
+## 安全设计
 
-- 这不是通用 onion 爬虫或开放代理；CLI 只访问配置的 E-API 主机。
-- 密码只经隐藏交互提示输入，绝不保存。
-- 会话密钥本地存储（chmod 600），需像密码一样保护。
-- 下载必须提供明确的书籍 `id`/`hash`，最多跟随 3 次重定向，且有大小封顶。
-- 用户需自行遵守适用的版权与访问规则。
+- 只访问 Z-Library 这一个站，不是什么 onion 网站都能用它访问
+- 密码只出现在隐藏输入里，用完就没了，不落盘不进日志
+- 会话凭证的存储文件权限是 600，等同密码，别提交到 git
+- 下载必须是明确的某本书（id + hash），大小有上限，重定向最多跟 3 次
+- 版权合规自己负责，别拿这个绕 DRM
 
 ## 许可证
 

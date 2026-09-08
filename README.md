@@ -1,37 +1,37 @@
 # zlibrary-tor
 
-Portable Agent Skill + JSON CLI for searching and downloading books from Z-Library's onion E-API through a local Tor SOCKS proxy. Works with Claude Code, Codex CLI, Hermes Agent, and any agent that loads [SKILL.md](SKILL.md)-style skills.
+An agent skill for Z-Library: your AI agent connects to Z-Library's onion site through a local Tor proxy and searches or downloads books for you. Every command outputs JSON, so the agent can parse results directly instead of scraping web pages.
+
+Works with Claude Code, Codex CLI, Hermes Agent, and any agent that loads SKILL.md-style skills.
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-## Why
+## Setup
 
-- **JSON-first**: every command emits JSON, so an agent can parse results deterministically — no HTML scraping, no fragile selectors.
-- **Tor-only by design**: the CLI talks to the v3 onion service through a SOCKS5 Tor listener and refuses clear-web or private-network targets by default.
-- **Password hygiene**: passwords are read from hidden prompts via `getpass`, used once, and never written to disk or logs. Only `remix_userid` / `remix_userkey` session values are stored (chmod 600).
-- **Bounded by construction**: v3 onion address validation, redirect limit, download size cap, no cookie jar, no fallback proxy.
+You need two things:
 
-## Install as an Agent Skill
+1. A local Tor with a SOCKS5 listener on `127.0.0.1:9050`. The easiest way: install Tor Browser and use the Tor it bundles.
+2. This repo cloned into your agent's skills directory:
 
-Clone into your agent's skills directory:
-
-| Agent | Path |
+| Agent | Clone to |
 |---|---|
 | Claude Code | `~/.claude/skills/zlibrary-tor` |
 | Codex CLI | `~/.codex/skills/zlibrary-tor` |
 | Hermes Agent | `~/.hermes/skills/zlibrary-tor` |
-| Custom | Anywhere — invoke `scripts/zlibrary_tor.py` directly |
+| Other | Anywhere; just invoke `scripts/zlibrary_tor.py` |
 
 ```bash
 git clone https://github.com/sl251/zlibrary-tor.git ~/.claude/skills/zlibrary-tor
 python -m pip install -r ~/.claude/skills/zlibrary-tor/scripts/requirements.txt
 ```
 
-Start Tor with a SOCKS5 listener on `127.0.0.1:9050` (Tor Browser's bundled Tor works), then verify the pipeline:
+Then run `doctor` once to confirm Tor and Z-Library are both reachable:
 
 ```bash
 python ~/.claude/skills/zlibrary-tor/scripts/zlibrary_tor.py doctor
 ```
+
+If you see this, you're good:
 
 ```json
 {
@@ -39,31 +39,33 @@ python ~/.claude/skills/zlibrary-tor/scripts/zlibrary_tor.py doctor
   "base_url": "http://loginzlib2vrak5zzpcocc3ouizykn6k5qecgj2tzlnab5wcbqhembyd.onion",
   "proxy": "configured",
   "authenticated": false,
-  "api_success": true
+  "api_success": 1
 }
 ```
 
-Read [SKILL.md](SKILL.md) for the agent workflow and [references/accounts.md](references/accounts.md) for account-registration and session-handling rules.
+After that, just tell your agent "search Z-Library for The Three-Body Problem" and it will follow the workflow in [SKILL.md](SKILL.md). For account registration and login, see [references/accounts.md](references/accounts.md).
 
-## CLI reference
+## Commands
 
-All commands output JSON. Authentication is optional for `doctor` and `search`, required for `profile` and `download`.
+Seven commands, all JSON output. `doctor` and `search` work without login; `profile` and `download` need one.
 
-### `doctor` — verify Tor + E-API reachability
+### doctor: check that Tor and the API are reachable
 
 ```bash
 python scripts/zlibrary_tor.py doctor
 ```
 
-### `login` — interactive login (hidden password prompt)
+### login: interactive login (password not echoed)
 
 ```bash
 python scripts/zlibrary_tor.py login --email you@example.com
 ```
 
-Stores the session in the config file (default `~/.config/zlibrary-tor/config.json`; override with `ZLIBRARY_TOR_CONFIG`). Already logged in via Tor Browser? `import-session` lets you paste existing `remix_userid` / `remix_userkey` values instead.
+The password prompt hides input, and the password is never written anywhere. Only the session values (`remix_userid` / `remix_userkey`) are saved, to `~/.config/zlibrary-tor/config.json` by default; override the location with `ZLIBRARY_TOR_CONFIG`.
 
-### `profile` — account info and download quota
+Already logged in via Tor Browser? Run `import-session` and paste the two remix values from the browser instead of typing your password again.
+
+### profile: account info and daily download quota
 
 ```bash
 python scripts/zlibrary_tor.py profile
@@ -71,9 +73,9 @@ python scripts/zlibrary_tor.py profile
 
 ```json
 {
-  "success": true,
+  "success": 1,
   "user": {
-    "id": "41934710",
+    "id": 12345678,
     "email": "you@example.com",
     "downloads_today": 0,
     "downloads_limit": 10
@@ -81,7 +83,7 @@ python scripts/zlibrary_tor.py profile
 }
 ```
 
-### `search` — find books
+### search: find books
 
 ```bash
 python scripts/zlibrary_tor.py search "三体" --limit 5 --language chinese
@@ -93,56 +95,60 @@ python scripts/zlibrary_tor.py search "三体" --limit 5 --language chinese
   "count": 5,
   "books": [
     {
-      "id": "123456789",
-      "hash": "abcdef0123456789abcdef",
+      "id": 26610712,
+      "hash": "def1ec",
       "title": "三体",
       "author": "刘慈欣",
-      "year": "2008",
-      "language": "chinese",
+      "year": 2008,
+      "language": "Chinese",
       "extension": "epub",
-      "filesizeString": "2.1 MB"
+      "filesizeString": "2.48 MB"
     }
   ]
 }
 ```
 
-### `download` — fetch a chosen book
+(Only the first result is shown here; you get 5 back.) Options: `--language`, `--extension` (epub, pdf, ...), `--limit` (max 20).
+
+### download: fetch a book
 
 ```bash
-python scripts/zlibrary_tor.py download --id 123456789 --hash abcdef0123456789abcdef
+python scripts/zlibrary_tor.py download --id 26610712 --hash def1ec
 ```
 
 ```json
 {
   "ok": true,
-  "path": "/abs/path/downloads/三体.epub",
-  "bytes": 2202011
+  "path": "downloads/三体.epub",
+  "bytes": 2598912
 }
 ```
 
-Options: `--output-dir` (default `downloads`), `--max-mb` (default 80, hard cap 512). The agent should ask you to pick a search result before downloading — see [SKILL.md](SKILL.md).
+`--output-dir` sets the save directory (default `downloads`), `--max-mb` caps the size (default 80 MB, max 512).
 
-### `register` — API account registration
+The normal flow: you pick a book from the search results, and the agent downloads it using that book's `id` and `hash`.
 
-Only when you specifically want API registration and have your own valid email. See [references/accounts.md](references/accounts.md) for the recommended Tor Browser path and the rules.
+### register: create a new account
 
-## Configuration
+Prefer registering manually in Tor Browser (there are CAPTCHAs and confirmation emails, which are easier to handle in a browser). If you specifically want API registration, see [references/accounts.md](references/accounts.md).
 
-| Env var | Meaning | Default |
+## Environment variables
+
+| Variable | What it does | Default |
 |---|---|---|
-| `ZLIBRARY_TOR_CONFIG` | Config file path | `~/.config/zlibrary-tor/config.json` |
-| `ZLIBRARY_TOR_PROXY` | Tor SOCKS5 proxy | `socks5://127.0.0.1:9050` |
-| `ZLIBRARY_BASE_URL` | E-API base URL | built-in v3 onion address |
+| `ZLIBRARY_TOR_CONFIG` | Where the config file lives | `~/.config/zlibrary-tor/config.json` |
+| `ZLIBRARY_TOR_PROXY` | Tor proxy address | `socks5://127.0.0.1:9050` |
+| `ZLIBRARY_BASE_URL` | Z-Library address | built-in onion address |
 
-Onion access requires a SOCKS5 Tor proxy — a conventional HTTP proxy (e.g. mihomo/clash) cannot resolve `.onion` services. If the server's Tor needs an upstream proxy, configure Tor itself with `HTTPSProxy`/`Socks5Proxy` rather than repointing this CLI. Details in [references/accounts.md](references/accounts.md#restricted-server-proxy-chain).
+A common trap: `.onion` addresses only resolve through Tor's SOCKS5. A regular proxy like mihomo/clash cannot reach them. If Tor itself needs an upstream proxy on your server, add `HTTPSProxy`/`Socks5Proxy` to Tor's config instead of pointing this CLI at mihomo.
 
-## Security
+## Security notes
 
-- This is not a general onion crawler or open proxy; the CLI only talks to the configured E-API host.
-- Passwords are accepted only through hidden interactive prompts and are never saved.
-- Session keys are stored locally (chmod 600) and must be protected like passwords.
-- Downloads require an explicit book `id`/`hash` pair, follow at most 3 redirects, and are size-capped.
-- Users are responsible for complying with applicable copyright and access rules.
+- Talks only to the configured Z-Library host; it is not a general onion browser
+- Passwords exist only inside hidden prompts; never saved, never logged
+- Session values are stored with chmod 600; treat them like passwords and keep them out of git
+- Downloads require an explicit book id + hash, are size-capped, and follow at most 3 redirects
+- You are responsible for complying with copyright and access rules; don't use this to bypass DRM
 
 ## License
 
