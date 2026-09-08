@@ -42,4 +42,4 @@ Environment variables `ZLIBRARY_REMIX_USERID` and `ZLIBRARY_REMIX_USERKEY` may s
 
 ## Restricted-server proxy chain
 
-When an Agent runs on a server where Tor cannot connect directly, keep the CLI pointed at the Tor listener (for example `socks5://tor:9050`). Configure the Tor process itself with `HTTPSProxy mihomo:7890` for an HTTP proxy, or `Socks5Proxy mihomo:7890` when Mihomo's port is a SOCKS/mixed inbound. The conventional proxy is Tor's upstream transport; it is not a replacement for Tor onion routing.
+When an Agent runs on a server where Tor cannot connect directly, keep the CLI pointed at the Tor listener (for example `socks5://tor:9050`). Configure Tor itself with `HTTPSProxy proxy-host:port` or `Socks5Proxy proxy-host:port`, according to the user's actual upstream protocol. The conventional proxy is Tor's upstream transport; it is not a replacement for Tor onion routing.

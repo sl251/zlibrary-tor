@@ -18,7 +18,7 @@ Use `scripts/zlibrary_tor.py` as the deterministic interface. It emits JSON for 
 
 The default configuration is `~/.config/zlibrary-tor/config.json` (or `%APPDATA%/zlibrary-tor/config.json` on Windows). Override it with `ZLIBRARY_TOR_CONFIG`. The default proxy is `socks5://127.0.0.1:9050`; override it with `ZLIBRARY_TOR_PROXY`.
 
-On restricted networks, the configured proxy must still be a Tor SOCKS listener. If Tor itself needs a conventional upstream proxy, configure Tor with `HTTPSProxy mihomo:7890` for an HTTP proxy or `Socks5Proxy mihomo:7890` for a SOCKS/mixed port; do not point this skill directly at Mihomo and assume it can resolve onion services.
+On restricted networks, the configured proxy must still be a Tor SOCKS listener. If Tor itself needs a conventional upstream proxy, configure Tor with `HTTPSProxy proxy-host:port` or `Socks5Proxy proxy-host:port`, matching the user's actual proxy protocol. Do not point this skill directly at a conventional proxy and assume it can resolve onion services.
 
 ## Account creation
 
