@@ -1,0 +1,4 @@
+interface:
+  display_name: "Z-Library via Tor"
+  short_description: "Search and download Z-Library books through Tor"
+  default_prompt: "Use $zlibrary-tor to search Z-Library through Tor and show me matching books."
