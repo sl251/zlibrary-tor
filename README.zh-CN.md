@@ -1,10 +1,36 @@
 # zlibrary-tor
 
-一个给 AI agent 用的 Z-Library 技能：让 agent 通过本机 Tor 代理连 Z-Library 的 onion 站，帮你搜书、下书。命令行输出全是 JSON，agent 拿到就能直接解析，不用抓网页。
+[![CI](https://github.com/sl251/zlibrary-tor/actions/workflows/test.yml/badge.svg)](https://github.com/sl251/zlibrary-tor/actions/workflows/test.yml)
 
-适用于 Claude Code、Codex CLI、Hermes Agent，以及其他支持 SKILL.md 格式技能的 agent。
+专为 AI Agent 设计的 Z-Library 技能与命令行工具：通过本地 Tor 代理访问 Z-Library onion 站，全部命令输出结构化 JSON 供 Agent 直接解析。下载具备配额感知能力，命中本地缓存时返回 `status: cached` 且不消耗每日下载额度，并提供分级失败诊断。采用标准 SKILL.md 格式，可直接挂载到 Claude Code、Codex CLI、Hermes Agent 与 Gemini CLI。
 
 [English](README.md) | [简体中文](README.zh-CN.md)
+
+## 特性
+
+- **onion E-API 直连**：通过本地 Tor SOCKS5 代理直连 Z-Library onion 官方 E-API，不经第三方镜像或网页抓取。
+- **Agent 原生 JSON CLI**：所有操作命令与错误响应均输出结构化 JSON，便于机器可靠解析与流程调度。
+- **配额感知下载**：结合 `.zlib-*.json` sidecar 文件校验本地大小与 SHA-256；命中缓存返回 `status: cached`，不消耗每日下载配额。
+- **Headless 凭据注入**：支持通过 stdin（`--stdin-password`）或环境变量（`ZLIBRARY_PASSWORD`、remix 令牌）进行无交互注入，密码不回显且明文不落盘。
+- **分页搜索**：支持按语言、文件格式过滤，支持明确的页码（page）与条数（limit）分页检索。
+- **离线测试与跨平台 CI**：测试套件基于 HTTPX `MockTransport` 构建，无需真实凭据、Tor 代理或下载配额，并在 Linux、macOS 与 Windows CI 矩阵中持续验证。
+
+## 快速开始
+
+1. **克隆仓库**：
+```bash
+git clone https://github.com/sl251/zlibrary-tor.git ~/.claude/skills/zlibrary-tor
+```
+
+2. **安装依赖**：
+```bash
+python -m pip install -r ~/.claude/skills/zlibrary-tor/scripts/requirements.txt
+```
+
+3. **运行 doctor 检查**：
+```bash
+python ~/.claude/skills/zlibrary-tor/scripts/zlibrary_tor.py doctor
+```
 
 ## 先装好这两样
 
@@ -17,11 +43,6 @@
 | Codex CLI | `~/.codex/skills/zlibrary-tor` |
 | Hermes Agent | `~/.hermes/skills/zlibrary-tor` |
 | 其他 | 随便放哪，直接调 `scripts/zlibrary_tor.py` |
-
-```bash
-git clone https://github.com/sl251/zlibrary-tor.git ~/.claude/skills/zlibrary-tor
-python -m pip install -r ~/.claude/skills/zlibrary-tor/scripts/requirements.txt
-```
 
 装完先跑一句 `doctor`，确认 Tor 和 Z-Library 都通：
 
@@ -168,7 +189,11 @@ uvx --from git+https://github.com/sl251/zlibrary-tor.git zlibrary-tor doctor
 | `ZLIBRARY_TOR_RETRIES` | 只读操作额外重试次数（0–2） | `1` |
 | `ZLIBRARY_BASE_URL` | Z-Library 地址 | 内置 onion 地址 |
 
-一个常见的坑：onion 网址必须走 Tor 的 SOCKS5，mihomo/clash 这类普通代理是解析不了 `.onion` 的。如果你的服务器上 Tor 本身需要上游代理，去 Tor 的配置里加 `HTTPSProxy`/`Socks5Proxy`，别把这个 CLI 指到 mihomo 上。
+## 常见坑
+
+- **`.onion` 域名只能通过 Tor SOCKS5 解析**：`.onion` 域名只能由 Tor 本地 SOCKS5 代理（默认 `127.0.0.1:9050`）解析与路由。mihomo/clash 等普通 HTTP/SOCKS 代理无法解析 `.onion`。如果服务器上的 Tor 本身需要上游代理，请在 Tor 配置文件（`torrc`）中配置 `HTTPSProxy`/`Socks5Proxy`，而不是将本 CLI 直接指向普通代理。
+- **申请下载链接可能消耗配额，不自动重试**：申请下载链接可能会计入今日下载配额，登录和注册接口也会产生服务端状态。因此，仅健康检查和搜索会对偶发网络抖动进行重试，登录、注册和申请下载链接绝不自动重试。
+- **不带 `.zlib-*.json` sidecar 的旧文件不自动信任**：下载缓存依赖对应 sidecar 记录的文件大小与 SHA-256 进行严格比对。下载目录下缺少有效 sidecar 的旧文件不会被自动信任为有效缓存，无法跳过下载请求。
 
 ## 安全设计
 

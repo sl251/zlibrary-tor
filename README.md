@@ -1,10 +1,36 @@
 # zlibrary-tor
 
-An agent skill for Z-Library: your AI agent connects to Z-Library's onion site through a local Tor proxy and searches or downloads books for you. Every command outputs JSON, so the agent can parse results directly instead of scraping web pages.
+[![CI](https://github.com/sl251/zlibrary-tor/actions/workflows/test.yml/badge.svg)](https://github.com/sl251/zlibrary-tor/actions/workflows/test.yml)
 
-Works with Claude Code, Codex CLI, Hermes Agent, and any agent that loads SKILL.md-style skills.
+An AI agent skill and CLI for accessing Z-Library's onion site through a local Tor proxy, with every command outputting structured JSON for direct parsing instead of web scraping. Downloads are quota-aware: local cache hits return `status: cached` without consuming daily download limits, alongside tiered failure diagnosis. Built in standard SKILL.md format to mount directly into Claude Code, Codex CLI, Hermes Agent, and Gemini CLI.
 
 [English](README.md) | [简体中文](README.zh-CN.md)
+
+## Features
+
+- **Direct onion E-API connection**: Connects directly to Z-Library's onion E-API through Tor SOCKS5 without depending on third-party web mirrors or scraping.
+- **Agent-native JSON CLI**: Every command outputs structured JSON to stdout for machine consumption, keeping error codes and failure reasons machine-parseable.
+- **Quota-aware downloads**: Verifies local file size and SHA-256 against `.zlib-*.json` sidecars; cache hits return `status: cached` without consuming daily download limits.
+- **Headless credential injection**: Authenticates non-interactively via stdin (`--stdin-password`) or environment variables (`ZLIBRARY_PASSWORD`, remix keys), with hidden password prompts and zero disk persistence for plaintext secrets.
+- **Paginated search**: Filters books by language and file extension, with explicit page and limit pagination controls.
+- **Offline testing & cross-platform CI**: Comprehensive test suite uses HTTPX `MockTransport` requiring no live credentials, Tor connection, or quota, validated on Linux, macOS, and Windows.
+
+## Quick start
+
+1. **Clone the repository**:
+```bash
+git clone https://github.com/sl251/zlibrary-tor.git ~/.claude/skills/zlibrary-tor
+```
+
+2. **Install dependencies**:
+```bash
+python -m pip install -r ~/.claude/skills/zlibrary-tor/scripts/requirements.txt
+```
+
+3. **Verify Tor and API connectivity**:
+```bash
+python ~/.claude/skills/zlibrary-tor/scripts/zlibrary_tor.py doctor
+```
 
 ## Setup
 
@@ -19,11 +45,6 @@ You need two things:
 | Codex CLI | `~/.codex/skills/zlibrary-tor` |
 | Hermes Agent | `~/.hermes/skills/zlibrary-tor` |
 | Other | Anywhere; just invoke `scripts/zlibrary_tor.py` |
-
-```bash
-git clone https://github.com/sl251/zlibrary-tor.git ~/.claude/skills/zlibrary-tor
-python -m pip install -r ~/.claude/skills/zlibrary-tor/scripts/requirements.txt
-```
 
 Then run `doctor` once to confirm Tor and Z-Library are both reachable:
 
@@ -170,7 +191,11 @@ This installs the CLI, not the agent's skill discovery files.
 | `ZLIBRARY_TOR_RETRIES` | Extra read-only attempts (0–2) | `1` |
 | `ZLIBRARY_BASE_URL` | Z-Library address | built-in onion address |
 
-A common trap: `.onion` addresses only resolve through Tor's SOCKS5. A regular proxy like mihomo/clash cannot reach them. If Tor itself needs an upstream proxy on your server, add `HTTPSProxy`/`Socks5Proxy` to Tor's config instead of pointing this CLI at mihomo.
+## Common pitfalls
+
+- **`.onion` domains require Tor SOCKS5**: `.onion` hostnames can only be resolved and reached through Tor's SOCKS5 proxy (`127.0.0.1:9050` by default). Standard HTTP/SOCKS proxies like mihomo or clash cannot resolve `.onion` addresses. If Tor itself requires an upstream proxy on your server, configure `HTTPSProxy` or `Socks5Proxy` inside Tor's configuration (`torrc`), rather than pointing this tool at mihomo or clash.
+- **No automatic retries for quota-sensitive calls**: Requesting a download link can consume your daily quota, and login/registration endpoints create server-side state. Therefore, health checks and searches retry on transient network errors, but login, registration, and download-link requests are never automatically retried.
+- **Pre-existing files without sidecars are not trusted**: Download cache checks strictly verify the local file size and SHA-256 against its `.zlib-*.json` sidecar. Pre-existing files in the download directory that lack a valid sidecar are not automatically trusted as cached copies and will not bypass download requests unless verified.
 
 ## Security notes
 
