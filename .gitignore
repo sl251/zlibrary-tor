@@ -1,6 +1,13 @@
 __pycache__/
 *.py[cod]
 .venv/
+.venv-*/
 downloads/
 config.json
 *.tmp
+*.part
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/

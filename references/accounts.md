@@ -32,6 +32,19 @@ python scripts/zlibrary_tor.py import-session
 
 The command prompts privately for both values. Session keys grant account access and must be protected like passwords.
 
+## Headless execution
+
+Without a TTY, login, import-session, and registration never fall back to visible prompts or implicit stdin reads. Missing credentials return JSON with `reason: credentials_required`.
+
+- `login --email you@example.com --stdin-password` reads one password line from an explicitly supplied pipe. Use a trusted secret manager as the producer; never use a literal password in an `echo` command or shell history. The pipe producer must close or supply a line; explicit stdin mode can wait for that producer.
+- `ZLIBRARY_PASSWORD` supplies a password for login or explicitly authorized registration. It is never saved to config. Avoid environment dumps and persistent shell profiles; clear it after use.
+- `ZLIBRARY_REMIX_USERID` and `ZLIBRARY_REMIX_USERKEY` supply an ephemeral session. `import-session` explicitly persists these environment values to config; normal search/profile/download do not.
+- Secret input precedence is explicit stdin, then the relevant environment value, then a private terminal prompt. No password or session-key command-line flags are provided.
+
+Run `python scripts/zlibrary_tor.py logout` to remove both saved session values while preserving other configuration. The result flags any session environment values still present. Clear those in the calling shell separately. This is local logout, not server-side token revocation.
+
+Config writes use a unique temporary file with POSIX 0600 permissions before replacement. On Windows, protect the config directory using account ACLs; chmod does not provide equivalent isolation.
+
 ## Configuration precedence
 
 1. Environment variables `ZLIBRARY_BASE_URL`, `ZLIBRARY_TOR_PROXY`, and `ZLIBRARY_TOR_CONFIG`.

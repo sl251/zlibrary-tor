@@ -5,12 +5,18 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import hashlib
 import ipaddress
 import json
+import math
 import os
 import re
+import socket
 import stat
 import sys
+import tempfile
+import time
+import warnings
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
@@ -34,7 +40,36 @@ MAX_REDIRECTS = 3
 
 
 class CliError(RuntimeError):
-    pass
+    def __init__(
+        self, message: str, *, reason: str = "command_failed", stage: str | None = None
+    ):
+        super().__init__(message)
+        self.reason = reason
+        self.stage = stage
+
+
+def secret(prompt: str, env: str, *, stdin: bool = False) -> str:
+    if stdin:
+        value = sys.stdin.readline().rstrip("\r\n")
+    elif os.environ.get(env):
+        value = os.environ[env]
+    else:
+        if not sys.stdin.isatty():
+            raise CliError(
+                "credentials require a private terminal or explicit secret input",
+                reason="credentials_required",
+            )
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", getpass.GetPassWarning)
+                value = getpass.getpass(prompt)
+        except (getpass.GetPassWarning, EOFError) as exc:
+            raise CliError(
+                "hidden credential input unavailable", reason="credentials_required"
+            ) from exc
+    if not value:
+        raise CliError("empty credential input", reason="credentials_required")
+    return value
 
 
 def config_path() -> Path:
@@ -60,13 +95,16 @@ def load_config() -> dict:
 def save_config(data: dict) -> None:
     path = config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_suffix(".tmp")
-    temp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    fd, name = tempfile.mkstemp(dir=path.parent, prefix=".config-", suffix=".tmp")
+    temp = Path(name)
     try:
-        temp.chmod(stat.S_IRUSR | stat.S_IWUSR)
-    except OSError:
-        pass
-    temp.replace(path)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            if os.name != "nt":
+                os.fchmod(handle.fileno(), stat.S_IRUSR | stat.S_IWUSR)
+            json.dump(data, handle, ensure_ascii=False, indent=2)
+        temp.replace(path)
+    finally:
+        temp.unlink(missing_ok=True)
 
 
 def settings() -> dict:
@@ -82,10 +120,25 @@ def settings() -> dict:
         "ZLIBRARY_REMIX_USERKEY", cfg.get("remix_userkey", "")
     )
     validate_base_url(cfg["base_url"])
-    if cfg["base_url"].lower().endswith(".onion") and not str(
+    if (urlparse(cfg["base_url"]).hostname or "").endswith(".onion") and not str(
         cfg["proxy"]
     ).lower().startswith(("socks5://", "socks5h://")):
         raise CliError("onion access requires a SOCKS5 Tor proxy")
+    try:
+        cfg["timeout"] = float(
+            os.environ.get("ZLIBRARY_TOR_TIMEOUT", cfg.get("timeout", 45))
+        )
+        cfg["retries"] = int(
+            os.environ.get("ZLIBRARY_TOR_RETRIES", cfg.get("retries", 1))
+        )
+    except (TypeError, ValueError) as exc:
+        raise CliError("timeout and retries must be numeric") from exc
+    if (
+        not math.isfinite(cfg["timeout"])
+        or not 1 <= cfg["timeout"] <= 600
+        or not 0 <= cfg["retries"] <= 2
+    ):
+        raise CliError("timeout must be 1..600 seconds; retries must be 0..2")
     return cfg
 
 
@@ -101,6 +154,8 @@ def validate_base_url(url: str) -> None:
 def validate_target(url: str, *, allow_http_onion: bool = False) -> None:
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower()
+    if parsed.username is not None or parsed.password is not None:
+        raise CliError("target URL must not contain credentials")
     if parsed.scheme not in {"http", "https"} or not host:
         raise CliError("refusing a non-HTTP(S) target")
     if host.endswith(".onion"):
@@ -145,9 +200,10 @@ def client(cfg: dict) -> httpx.Client:
     proxy = str(cfg.get("proxy", "")).replace("socks5h://", "socks5://", 1)
     return httpx.Client(
         proxy=proxy or None,
-        timeout=httpx.Timeout(45.0, connect=30.0),
+        timeout=httpx.Timeout(cfg.get("timeout", 45.0)),
         headers=HEADERS,
         follow_redirects=False,
+        trust_env=False,
     )
 
 
@@ -158,40 +214,57 @@ def request_json(
     *,
     data: dict | None = None,
     authenticated: bool = False,
+    retryable: bool = False,
 ) -> dict:
     headers, cookies = auth(cfg) if authenticated else ({}, {})
-    try:
-        with client(cfg) as session:
-            response = session.request(
-                method,
-                cfg["base_url"] + path,
-                data=data,
-                headers=headers,
-                cookies=cookies,
-            )
-    except httpx.HTTPError as exc:
-        raise CliError(f"network error: {type(exc).__name__}: {exc}") from exc
+    attempts = 1 + (cfg.get("retries", 1) if retryable else 0)
+    for attempt in range(attempts):
+        try:
+            with client(cfg) as session:
+                session.cookies.update(cookies)
+                response = session.request(
+                    method,
+                    cfg["base_url"] + path,
+                    data=data,
+                    headers=headers,
+                )
+            if response.status_code not in {502, 503, 504} or attempt + 1 == attempts:
+                break
+        except httpx.TransportError as exc:
+            if attempt + 1 == attempts:
+                raise CliError(
+                    f"network error: {type(exc).__name__}", reason="network_error"
+                ) from exc
+        time.sleep(0.5 * 2**attempt)
     if response.status_code in REDIRECTS:
         raise CliError(f"unexpected API redirect (HTTP {response.status_code})")
     try:
         payload = response.json()
     except ValueError as exc:
-        sample = response.text[:160].replace("\n", " ")
         raise CliError(
-            f"API returned non-JSON HTTP {response.status_code}: {sample}"
+            f"API returned non-JSON HTTP {response.status_code}",
+            reason="invalid_response",
         ) from exc
+    if not isinstance(payload, dict):
+        raise CliError(
+            "API returned a non-object JSON response", reason="invalid_response"
+        )
     if response.status_code >= 400:
-        raise CliError(f"API HTTP {response.status_code}: {payload}")
+        raise CliError(f"API HTTP {response.status_code}", reason="api_http_error")
     return payload
 
 
 def extract_session(payload: dict) -> tuple[str, str]:
     user = payload.get("user") or payload.get("response") or {}
+    if not isinstance(user, dict):
+        raise CliError("invalid login response", reason="invalid_response")
     uid = str(user.get("id") or user.get("user_id") or "")
     key = str(user.get("remix_userkey") or user.get("user_key") or "")
     if not payload.get("success") or not uid or not key:
-        message = payload.get("error") or payload.get("message") or "login failed"
-        raise CliError(str(message))
+        raise CliError(
+            "login failed; check credentials or complete browser challenges",
+            reason="login_failed",
+        )
     return uid, key
 
 
@@ -200,7 +273,28 @@ def emit(value: object) -> None:
 
 
 def cmd_doctor(cfg: dict, _args) -> None:
-    payload = request_json(cfg, "GET", "/eapi/info")
+    proxy = urlparse(cfg["proxy"])
+    try:
+        with socket.create_connection(
+            (proxy.hostname or "127.0.0.1", proxy.port or 9050),
+            timeout=min(cfg.get("timeout", 45), 5),
+        ):
+            pass
+    except OSError as exc:
+        raise CliError(
+            "cannot connect to the configured proxy; check Tor listener",
+            reason="proxy_unreachable",
+            stage="local_proxy",
+        ) from exc
+    try:
+        payload = request_json(cfg, "GET", "/eapi/info", retryable=True)
+    except CliError as exc:
+        exc.stage = "api_response" if exc.reason != "network_error" else "onion_request"
+        raise
+    if not payload.get("success"):
+        raise CliError(
+            "API health check failed", reason="api_failed", stage="api_response"
+        )
     emit(
         {
             "ok": True,
@@ -213,7 +307,9 @@ def cmd_doctor(cfg: dict, _args) -> None:
 
 
 def cmd_login(cfg: dict, args) -> None:
-    password = getpass.getpass("Z-Library password: ")
+    password = secret(
+        "Z-Library password: ", "ZLIBRARY_PASSWORD", stdin=args.stdin_password
+    )
     payload = request_json(
         cfg,
         "POST",
@@ -229,8 +325,8 @@ def cmd_login(cfg: dict, args) -> None:
 
 
 def cmd_import_session(cfg: dict, _args) -> None:
-    uid = getpass.getpass("remix_userid: ").strip()
-    key = getpass.getpass("remix_userkey: ").strip()
+    uid = secret("remix_userid: ", "ZLIBRARY_REMIX_USERID").strip()
+    key = secret("remix_userkey: ", "ZLIBRARY_REMIX_USERKEY").strip()
     if not uid or not key:
         raise CliError("both session values are required")
     stored = load_config()
@@ -249,8 +345,8 @@ def cmd_import_session(cfg: dict, _args) -> None:
 def cmd_register(cfg: dict, args) -> None:
     if not args.yes:
         raise CliError("registration creates an external account; rerun with --yes")
-    password = getpass.getpass("New password: ")
-    repeated = getpass.getpass("Repeat password: ")
+    password = secret("New password: ", "ZLIBRARY_PASSWORD")
+    repeated = secret("Repeat password: ", "ZLIBRARY_PASSWORD")
     if password != repeated or not password:
         raise CliError("passwords do not match or are empty")
     payload = request_json(
@@ -259,17 +355,67 @@ def cmd_register(cfg: dict, args) -> None:
         "/eapi/user/registration",
         data={"email": args.email, "password": password, "name": args.name},
     )
-    emit({"ok": bool(payload.get("success")), "response": payload})
+    if not payload.get("success"):
+        raise CliError(
+            "registration failed; complete registration in Tor Browser",
+            reason="registration_failed",
+        )
+    emit({"ok": True, "message": "complete any email confirmation in your browser"})
+
+
+def cmd_logout(_cfg: dict, _args) -> None:
+    stored = load_config()
+    for key in ("remix_userid", "remix_userkey"):
+        stored.pop(key, None)
+    if config_path().exists():
+        save_config(stored)
+    emit(
+        {
+            "ok": True,
+            "environment_session_present": bool(
+                os.environ.get("ZLIBRARY_REMIX_USERID")
+                or os.environ.get("ZLIBRARY_REMIX_USERKEY")
+            ),
+            "server_session_revoked": False,
+        }
+    )
 
 
 def cmd_profile(cfg: dict, _args) -> None:
     if not auth(cfg)[0]:
         raise CliError("no session; run login or import-session")
-    emit(request_json(cfg, "GET", "/eapi/user/profile", authenticated=True))
+    payload = request_json(cfg, "GET", "/eapi/user/profile", authenticated=True)
+    if not payload.get("success"):
+        raise CliError("profile request failed", reason="profile_failed")
+    emit(redact_credentials(payload))
+
+
+def redact_credentials(value):
+    if isinstance(value, dict):
+        return {
+            key: redact_credentials(item)
+            for key, item in value.items()
+            if key.lower().replace("-", "_")
+            not in {
+                "password",
+                "remix_userkey",
+                "user_key",
+                "token",
+                "access_token",
+                "refresh_token",
+            }
+        }
+    if isinstance(value, list):
+        return [redact_credentials(item) for item in value]
+    return value
 
 
 def cmd_search(cfg: dict, args) -> None:
-    data: dict[str, object] = {"message": args.query, "limit": min(args.limit, 20)}
+    data: dict[str, object] = {
+        "message": args.query,
+        "limit": args.limit,
+        "page": args.page,
+    }
     if args.language:
         data["languages[]"] = args.language
     if args.extension:
@@ -280,7 +426,13 @@ def cmd_search(cfg: dict, args) -> None:
         "/eapi/book/search",
         data=data,
         authenticated=bool(auth(cfg)[0]),
+        retryable=True,
     )
+    raw_books = payload.get("books") or []
+    if not isinstance(raw_books, list) or any(
+        not isinstance(book, dict) for book in raw_books
+    ):
+        raise CliError("invalid search response", reason="invalid_response")
     books = [
         {
             key: book.get(key)
@@ -295,21 +447,35 @@ def cmd_search(cfg: dict, args) -> None:
                 "filesizeString",
             )
         }
-        for book in payload.get("books") or []
+        for book in raw_books
     ]
-    emit({"ok": bool(payload.get("success")), "count": len(books), "books": books})
+    if not payload.get("success"):
+        raise CliError("search failed", reason="search_failed")
+    emit({"ok": True, "page": args.page, "count": len(books), "books": books})
 
 
 def safe_filename(value: str) -> str:
     cleaned = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", value).strip(" .")
-    return cleaned[:180] or "book"
+    cleaned = cleaned[:140].rstrip(" .") or "book"
+    if cleaned.split(".")[0].upper() in {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        *(f"COM{i}" for i in range(10)),
+        *(f"LPT{i}" for i in range(10)),
+    }:
+        cleaned = "_" + cleaned
+    return cleaned
 
 
 def download_stream(cfg: dict, url: str, output: Path, max_bytes: int) -> int:
     current = url
-    headers, cookies = auth(cfg)
     for hop in range(MAX_REDIRECTS + 1):
-        validate_target(current, allow_http_onion=current.startswith(cfg["base_url"]))
+        same_origin = origin(current) == origin(cfg["base_url"])
+        validate_target(current, allow_http_onion=same_origin)
+        headers, cookies = auth(cfg) if same_origin else ({}, {})
+        headers = {**headers, "Accept-Encoding": "identity"}
         with (
             client(cfg) as session,
             session.stream(
@@ -325,22 +491,134 @@ def download_stream(cfg: dict, url: str, output: Path, max_bytes: int) -> int:
                 current = urljoin(current, location)
                 continue
             response.raise_for_status()
+            if response.status_code != 200:
+                raise CliError(
+                    "expected a complete file response", reason="invalid_download"
+                )
+            if (
+                response.headers.get("content-encoding", "identity").lower()
+                != "identity"
+            ):
+                raise CliError(
+                    "unexpected encoded file response", reason="invalid_download"
+                )
+            media_type = response.headers.get("content-type", "").split(";")[0].lower()
+            if media_type in {"text/html", "application/json"}:
+                raise CliError(
+                    "server returned a page instead of a book",
+                    reason="invalid_download",
+                )
+            length = response.headers.get("content-length")
+            if length is not None and (
+                not length.isdecimal() or int(length) > max_bytes
+            ):
+                raise CliError(
+                    "invalid or oversized Content-Length", reason="invalid_download"
+                )
             written = 0
-            with output.open("wb") as handle:
-                for chunk in response.iter_bytes():
-                    written += len(chunk)
-                    if written > max_bytes:
-                        handle.close()
-                        output.unlink(missing_ok=True)
+            fd, name = tempfile.mkstemp(
+                dir=output.parent, prefix=".zlib-", suffix=".part"
+            )
+            temporary = Path(name)
+            try:
+                with os.fdopen(fd, "wb") as handle:
+                    for chunk in response.iter_bytes():
+                        written += len(chunk)
+                        if written > max_bytes:
+                            raise CliError(
+                                "download exceeds size limit", reason="size_limit"
+                            )
+                        handle.write(chunk)
+                    if not written or (length is not None and written != int(length)):
                         raise CliError(
-                            f"download exceeds {max_bytes // 1024 // 1024} MiB"
+                            "empty or incomplete download", reason="incomplete_download"
                         )
-                    handle.write(chunk)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                temporary.replace(output)
+            finally:
+                temporary.unlink(missing_ok=True)
             return written
     raise CliError("download redirect failure")
 
 
+def origin(url: str) -> tuple:
+    parsed = urlparse(url)
+    return (
+        parsed.scheme,
+        parsed.hostname,
+        parsed.port or (443 if parsed.scheme == "https" else 80),
+    )
+
+
+def digest(path: Path) -> str:
+    with path.open("rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
+
+
+def cache_key(cfg: dict, args) -> str:
+    return hashlib.sha256(
+        f"{cfg['base_url']}\n{args.id}\n{args.hash}".encode()
+    ).hexdigest()
+
+
+def cached_file(manifest: Path, output_dir: Path, max_bytes: int) -> Path | None:
+    try:
+        record = json.loads(manifest.read_text(encoding="utf-8"))
+        if not isinstance(record, dict) or not isinstance(record.get("name"), str):
+            return None
+        output = output_dir / record["name"]
+        if (
+            output.is_symlink()
+            or output.resolve().parent != output_dir
+            or not output.is_file()
+        ):
+            return None
+        size = output.stat().st_size
+        if (
+            0 < size <= max_bytes
+            and size == record.get("bytes")
+            and digest(output) == record.get("sha256")
+        ):
+            return output
+    except (OSError, ValueError):
+        pass
+    return None
+
+
 def cmd_download(cfg: dict, args) -> None:
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    lock = output_dir / f".zlib-{cache_key(cfg, args)}.lock"
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError as exc:
+        raise CliError(
+            "download already running; remove stale lock only after checking no process is active",
+            reason="download_locked",
+        ) from exc
+    try:
+        os.close(fd)
+        download_locked(cfg, args, output_dir)
+    finally:
+        lock.unlink(missing_ok=True)
+
+
+def download_locked(cfg: dict, args, output_dir: Path) -> None:
+    key = cache_key(cfg, args)
+    manifest = output_dir / f".zlib-{key}.json"
+    max_bytes = args.max_mb * 1024 * 1024
+    existing = cached_file(manifest, output_dir, max_bytes)
+    if existing and not args.force:
+        emit(
+            {
+                "ok": True,
+                "status": "cached",
+                "path": str(existing),
+                "bytes": existing.stat().st_size,
+            }
+        )
+        return
     if not auth(cfg)[0]:
         raise CliError("download requires a session; run login or import-session")
     payload = request_json(
@@ -350,29 +628,79 @@ def cmd_download(cfg: dict, args) -> None:
         authenticated=True,
     )
     file_info = payload.get("file") or {}
+    if not isinstance(file_info, dict):
+        raise CliError("invalid file response", reason="invalid_response")
     url = str(file_info.get("downloadLink") or "")
     if not payload.get("success") or not url:
-        raise CliError(str(payload.get("error") or "download link unavailable"))
+        message = str(payload.get("error") or payload.get("message") or "").lower()
+        # Conservative recognition only; unknown failures must not be labelled quota errors.
+        quota = any(
+            term in message
+            for term in (
+                "daily download limit",
+                "daily limit reached",
+                "download quota exceeded",
+                "daily_quota_exhausted",
+            )
+        )
+        raise CliError(
+            "daily download quota exhausted" if quota else "download link unavailable",
+            reason="daily_quota_exhausted" if quota else "download_link_unavailable",
+        )
     extension = safe_filename(str(file_info.get("extension") or "bin")).lower()
     description = str(file_info.get("description") or f"book_{args.id}")
     name = safe_filename(description.split(" (")[0])
-    if not name.lower().endswith("." + extension):
-        name += "." + extension
-    output_dir = Path(args.output_dir).expanduser().resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if name.lower().endswith("." + extension):
+        name = name[: -(len(extension) + 1)]
+    extension = extension[:12]
+    name = f"{name}-{key[:16]}.{extension}"
     output = output_dir / name
-    max_bytes = max(1, min(args.max_mb, 512)) * 1024 * 1024
+    if output.exists() and not args.force:
+        raise CliError(
+            "unverified existing file; use --force to replace", reason="file_exists"
+        )
     size = download_stream(cfg, url, output, max_bytes)
-    emit({"ok": True, "path": str(output), "bytes": size})
+    record = {"name": output.name, "bytes": size, "sha256": digest(output)}
+    fd, temp_name = tempfile.mkstemp(dir=output_dir, prefix=".zlib-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(record, handle)
+        Path(temp_name).replace(manifest)
+    finally:
+        Path(temp_name).unlink(missing_ok=True)
+    emit({"ok": True, "status": "downloaded", "path": str(output), "bytes": size})
+
+
+class JsonParser(argparse.ArgumentParser):
+    def error(self, message):
+        # argparse messages may echo secret or untrusted command-line values.
+        raise CliError(
+            "invalid arguments; run --help for usage", reason="invalid_arguments"
+        )
+
+
+def positive(value: str) -> int:
+    number = int(value)
+    if number < 1:
+        raise ValueError("must be positive")
+    return number
+
+
+def identifier(value: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", value):
+        raise ValueError("invalid book identifier")
+    return value
 
 
 def parser() -> argparse.ArgumentParser:
-    root = argparse.ArgumentParser(description=__doc__)
+    root = JsonParser(description=__doc__)
     commands = root.add_subparsers(dest="command", required=True)
     commands.add_parser("doctor")
     login = commands.add_parser("login")
     login.add_argument("--email", required=True)
+    login.add_argument("--stdin-password", action="store_true")
     commands.add_parser("import-session")
+    commands.add_parser("logout")
     register = commands.add_parser("register")
     register.add_argument("--email", required=True)
     register.add_argument("--name", required=True)
@@ -380,14 +708,16 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("profile")
     search = commands.add_parser("search")
     search.add_argument("query")
-    search.add_argument("--limit", type=int, default=5)
+    search.add_argument("--limit", type=positive, choices=range(1, 21), default=5)
+    search.add_argument("--page", type=positive, default=1)
     search.add_argument("--language", default="")
     search.add_argument("--extension", default="")
     download = commands.add_parser("download")
-    download.add_argument("--id", required=True)
-    download.add_argument("--hash", required=True)
+    download.add_argument("--id", type=identifier, required=True)
+    download.add_argument("--hash", type=identifier, required=True)
     download.add_argument("--output-dir", default="downloads")
-    download.add_argument("--max-mb", type=int, default=80)
+    download.add_argument("--max-mb", type=positive, choices=range(1, 513), default=80)
+    download.add_argument("--force", action="store_true")
     return root
 
 
@@ -395,6 +725,7 @@ COMMANDS = {
     "doctor": cmd_doctor,
     "login": cmd_login,
     "import-session": cmd_import_session,
+    "logout": cmd_logout,
     "register": cmd_register,
     "profile": cmd_profile,
     "search": cmd_search,
@@ -403,11 +734,18 @@ COMMANDS = {
 
 
 def main() -> int:
-    args = parser().parse_args()
     try:
-        COMMANDS[args.command](settings(), args)
-    except (CliError, httpx.HTTPError, OSError) as exc:
-        emit({"ok": False, "error": str(exc)})
+        args = parser().parse_args()
+        COMMANDS[args.command]({} if args.command == "logout" else settings(), args)
+    except (CliError, httpx.HTTPError, OSError, ValueError) as exc:
+        result = {
+            "ok": False,
+            "error": str(exc) if isinstance(exc, CliError) else type(exc).__name__,
+            "reason": getattr(exc, "reason", "command_failed"),
+        }
+        if getattr(exc, "stage", None):
+            result["stage"] = exc.stage
+        emit(result)
         return 1
     return 0
 
