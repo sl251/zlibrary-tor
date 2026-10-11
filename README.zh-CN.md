@@ -195,6 +195,30 @@ python scripts/zlibrary_tor.py accounts use personal
 python scripts/zlibrary_tor.py accounts remove old_account
 ```
 
+### domains：管理 onion 域名与镜像
+
+```bash
+# 列出已配置的原点、信任级别及核验信息（纯本地操作，零网络）
+python scripts/zlibrary_tor.py domains list
+
+# 无凭据探测候选 onion 地址（仅发送一次无凭据 GET /eapi/info）
+python scripts/zlibrary_tor.py domains check --url "http://<candidate>.onion"
+
+# 人工核验官方来源并明确确认完整主机名后登记原点
+python scripts/zlibrary_tor.py domains add backup \
+  --url "http://<verified>.onion" \
+  --verified-from "https://official-announcement-url" \
+  --confirm-host "<verified>.onion"
+
+# 切换当前使用的基础原点（纯本地操作，绝不迁移任何会话凭据）
+python scripts/zlibrary_tor.py domains use backup
+
+# 移除已保存域名（当前正在使用的域名禁止移除）
+python scripts/zlibrary_tor.py domains remove backup
+```
+
+候选探测不附带任何凭据，接口兼容不代表官方身份；登记域名必须经过人工核验并显式确认主机名，工具绝不自动抓取候选来源；切换域名不会迁移或转发任何登录凭据，未核验原点禁止发起认证请求。
+
 
 ### 自动化与可靠下载
 

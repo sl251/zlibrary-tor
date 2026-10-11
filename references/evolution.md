@@ -13,19 +13,25 @@
 - 多账号配置（v2 schema、别名管理、POSIX 0600）与严格原点绑定（防凭据泄漏）；`accounts list/use/remove` 纯本地执行零网络。
 - 显式配额预检选择（`--account auto`，仅限 download）：仅在链接申请前依据已确认配额做一次性预检；不搞失败后自动轮换，不换账号重试，不可与 `--force` 混用。
 - 锁协调与缓存前置：同书锁与下载协调锁保证并发安全；命中本地缓存先于一切网络请求与配额消耗。
+- v3 onion 规范校验：依据 Tor 规范 Base32 解码 35 字节并校验版本 3 与 SHA3-256 checksum，限制根级 onion 原点及默认端口（80/443），拒绝 userinfo、子域、路径、参数及片段，报错返回固定安全文本不回显输入。
+- 无凭据域名探测与健康检查：`domains check` 与扩展 `doctor` 使用隔离 client 发起无凭据 GET `/eapi/info`（限 64 KiB），区分 `reachable`、`api_compatible` 与 `ownership_verified: false`，遇到 302 重定向不跟随，不执行 HTML/JS，严格校验 JSON success 类型，不关 TLS 验证。
+- 人工登记与显式切换：`domains add` 需显式提供 `--verified-from` 与 `--confirm-host` 人工核验凭证才保存记录；`domains use` 仅切换原点不迁移任何 session；`require_trusted_origin` 在所有认证操作前强制白名单核验，未登记原点报 `untrusted_origin` 零网络；正在使用的域名禁止 remove（`domain_in_use`）；首版不做自动发现启用与自动回退。
+- 跨已核验原点缓存复用：缓存键升级为服务级书籍标识 `sha256("zlibrary\n" + book_id + "\n" + book_hash)`；旧缓存按本地已信任原点旧键回退查找并通过 `cached_file` 验证（非软链接、大小、SHA-256）后原子写新 sidecar，不删旧 sidecar，不跨未信任原点复用。
 
 ## 暂缓及验收条件
 
 | 建议 | 当前决定与后续条件 |
 |---|---|
-| 自动切换备用 onion | 未验证镜像的归属与会话信任关系，不内置列表、不自动迁移凭据。先获得可信官方来源，再定义按主机授权与故障策略。 |
+| 自动切换备用 onion / 自动发现启用 | PR2 实现了人工核验登记（`domains add`）与显式切换（`domains use`），但仍不提供自动候选抓取、定时后台探测或请求失败后的自动镜像回退。未验证镜像的归属与会话信任关系，不自动迁移凭据。先获得可信官方来源与独立签名机制，再定义故障分类与回退策略。 |
 | 断点续传 | `Accept-Ranges` 不足以保证安全拼接。需要验证 206、Content-Range、总长度及 ETag/Last-Modified；响应 200 时必须重新开始，还要处理下载 URL 过期与配额副作用。 |
 | 独立 `info` 命令 | 先获取当前接口及返回结构的可信证据，再增加契约测试；不猜测接口路径或宣称存在未验证的 ISBN、评分字段。 |
 | MCP Server | 属于独立集成层，需确定客户端需求、依赖、工具授权和输出目录边界。先稳定 JSON CLI，再作为可选依赖实现。 |
 
 ## 不作过度保证
 
-- v3 onion 当前检查是主机名格式检查，不是服务归属验证。
+- v3 onion 当前检查是主机名格式与 Tor 规范 checksum 检查，不是服务归属验证。
+- `domains check` 接口兼容（`api_compatible: true`）与 HTTPS 证书仅证明服务实现了对应 JSON 接口或持有该域名证书，不证明运营者身份。
+- 人工登记记录（`source`、`verified_at`）是本地审计备忘，不代表程序完成了密码学身份认证。
 - 对私有 IP 字面量和常见本地主机名的拒绝不是完整的 DNS 重绑定防护；代理端 DNS 解析不应改成本地解析来假装解决，以免泄漏查询。
 - TCP 端口可达不能证明它是 SOCKS5、Tor 已完成引导或目标 onion 正常，因此诊断只报告实际观测到的阶段。
 - 原子写入保证失败时不发布本次残缺传输；没有服务端长度或可信校验和时，不能保证内容“100% 完整”。本地 SHA-256 用于检测缓存变化，不证明出版物真实性。

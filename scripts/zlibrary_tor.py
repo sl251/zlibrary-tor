@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import getpass
 import hashlib
@@ -38,6 +39,7 @@ HEADERS = {
 }
 REDIRECTS = {301, 302, 303, 307, 308}
 MAX_REDIRECTS = 3
+MAX_PROBE_BYTES = 64 * 1024
 
 
 class CliError(RuntimeError):
@@ -79,6 +81,73 @@ def secret(prompt: str, env: str, *, stdin: bool = False) -> str:
     return value
 
 
+def is_valid_v3_onion(host: str) -> bool:
+    if not isinstance(host, str):
+        return False
+    host = host.lower()
+    if not host.endswith(".onion") or host.endswith(".onion."):
+        return False
+    label = host[:-6]
+    if "." in label:
+        return False
+    if not re.fullmatch(r"[a-z2-7]{56}", label):
+        return False
+    try:
+        raw = base64.b32decode(label.upper())
+    except Exception:
+        return False
+    if len(raw) != 35:
+        return False
+    pubkey = raw[:32]
+    checksum = raw[32:34]
+    version = raw[34]
+    if version != 3:
+        return False
+    expected_checksum = hashlib.sha3_256(
+        b".onion checksum" + pubkey + bytes([version])
+    ).digest()[:2]
+    return checksum == expected_checksum
+
+
+def validate_onion_origin(url: str) -> str:
+    if not isinstance(url, str):
+        raise CliError("invalid onion origin", reason="invalid_origin")
+    try:
+        parsed = urlparse(url)
+    except Exception as exc:
+        raise CliError("invalid onion origin", reason="invalid_origin") from exc
+
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in {"http", "https"}:
+        raise CliError("invalid onion origin", reason="invalid_origin")
+
+    if (
+        parsed.username is not None
+        or parsed.password is not None
+        or "@" in parsed.netloc
+    ):
+        raise CliError("invalid onion origin", reason="invalid_origin")
+
+    if parsed.path not in {"", "/"}:
+        raise CliError("invalid onion origin", reason="invalid_origin")
+
+    if parsed.query or parsed.fragment:
+        raise CliError("invalid onion origin", reason="invalid_origin")
+
+    port = parsed.port
+    if port is not None:
+        if scheme == "http" and port != 80:
+            raise CliError("invalid onion origin", reason="invalid_origin")
+        if scheme == "https" and port != 443:
+            raise CliError("invalid onion origin", reason="invalid_origin")
+
+    host = (parsed.hostname or "").lower()
+    if not is_valid_v3_onion(host):
+        raise CliError("invalid onion origin", reason="invalid_origin")
+
+    return f"{scheme}://{host}"
+
+
 def normalize_origin(url: str) -> str:
     parsed = urlparse(url)
     scheme = (parsed.scheme or "http").lower()
@@ -91,6 +160,84 @@ def normalize_origin(url: str) -> str:
     ):
         return f"{scheme}://{host}"
     return f"{scheme}://{host}:{port}"
+
+
+def _normalize_domains(cfg: dict) -> dict:
+    raw_domains = cfg.get("domains")
+    primary_origin = normalize_origin(DEFAULT_BASE_URL)
+    if raw_domains is None:
+        domains = {
+            "primary": {
+                "url": primary_origin,
+                "trust": "builtin",
+                "source": "repository-default",
+                "verified_at": None,
+            }
+        }
+        custom_base = cfg.get("base_url")
+        if custom_base:
+            norm_custom = normalize_origin(custom_base)
+            if norm_custom != primary_origin:
+                domains["custom"] = {
+                    "url": norm_custom,
+                    "trust": "legacy_unverified",
+                    "source": "legacy-config",
+                    "verified_at": None,
+                }
+        return domains
+
+    if not isinstance(raw_domains, dict):
+        raise CliError(
+            "domains in config must be a dictionary", reason="invalid_config"
+        )
+
+    domains = {}
+    for name, d in raw_domains.items():
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", name):
+            raise CliError("invalid domain record in config", reason="invalid_config")
+        if not isinstance(d, dict) or not isinstance(d.get("url"), str):
+            raise CliError("invalid domain record in config", reason="invalid_config")
+        trust = d.get("trust", "unverified")
+        url_val = normalize_origin(d["url"])
+        if trust == "builtin" and url_val != primary_origin:
+            trust = "legacy_unverified"
+        domains[name] = {
+            "url": url_val,
+            "trust": trust,
+            "source": d.get("source"),
+            "verified_at": d.get("verified_at"),
+        }
+
+    if "primary" not in domains:
+        domains["primary"] = {
+            "url": primary_origin,
+            "trust": "builtin",
+            "source": "repository-default",
+            "verified_at": None,
+        }
+
+    return domains
+
+
+def is_trusted_origin(cfg: dict, origin: str) -> bool:
+    norm_origin = normalize_origin(origin)
+    domains = cfg.get("domains")
+    if not isinstance(domains, dict):
+        return norm_origin == normalize_origin(DEFAULT_BASE_URL)
+    for d in domains.values():
+        if isinstance(d, dict) and d.get("trust") in {"builtin", "user_verified"}:
+            if normalize_origin(str(d.get("url", ""))) == norm_origin:
+                return True
+    return False
+
+
+def require_trusted_origin(cfg: dict, origin: str | None = None) -> None:
+    target = origin or cfg.get("base_url", "")
+    if not is_trusted_origin(cfg, target):
+        raise CliError(
+            "target origin is not a trusted domain",
+            reason="untrusted_origin",
+        )
 
 
 @contextlib.contextmanager
@@ -163,6 +310,7 @@ def normalize_config(raw: dict) -> dict:
         cfg.setdefault("timeout", 45)
         cfg.setdefault("retries", 1)
         cfg.setdefault("default_account", None)
+        cfg["domains"] = _normalize_domains(cfg)
         return cfg
 
     # Legacy config (no schema_version or < 2)
@@ -206,6 +354,7 @@ def normalize_config(raw: dict) -> dict:
 
     cfg["accounts"] = accounts
     cfg["default_account"] = default_acc
+    cfg["domains"] = _normalize_domains(cfg)
     return cfg
 
 
@@ -339,11 +488,7 @@ def validate_target(url: str, *, allow_http_onion: bool = False) -> None:
     if parsed.scheme not in {"http", "https"} or not host:
         raise CliError("refusing a non-HTTP(S) target")
     if host.endswith(".onion"):
-        label = host[:-6]
-        valid = len(label) == 56 and all(
-            c in "abcdefghijklmnopqrstuvwxyz234567" for c in label
-        )
-        if not valid:
+        if not is_valid_v3_onion(host):
             raise CliError("refusing an invalid/non-v3 onion address")
         if parsed.scheme != "https" and not allow_http_onion:
             raise CliError("HTTP is allowed only for the configured onion service")
@@ -367,6 +512,7 @@ def auth(cfg: dict) -> tuple[dict, dict]:
     key = str(cfg.get("remix_userkey", ""))
     if not uid or not key:
         return {}, {}
+    require_trusted_origin(cfg)
     origin_val = str(cfg.get("session_origin") or "")
     if origin_val and normalize_origin(origin_val) != normalize_origin(
         cfg.get("base_url", "")
@@ -403,6 +549,8 @@ def request_json(
     authenticated: bool = False,
     retryable: bool = False,
 ) -> dict:
+    if authenticated:
+        require_trusted_origin(cfg)
     headers, cookies = auth(cfg) if authenticated else ({}, {})
     attempts = 1 + (cfg.get("retries", 1) if retryable else 0)
     response = None
@@ -750,6 +898,84 @@ def emit(value: object) -> None:
     print(json.dumps(value, ensure_ascii=False, indent=2))
 
 
+def probe_domain(cfg: dict, target_url: str) -> dict:
+    norm_url = validate_onion_origin(target_url)
+    probe_cfg = {
+        "proxy": cfg.get("proxy", DEFAULT_PROXY),
+        "timeout": cfg.get("timeout", 45.0),
+    }
+
+    try:
+        with client(probe_cfg) as session:
+            with session.stream(
+                "GET",
+                norm_url + "/eapi/info",
+                headers=HEADERS,
+            ) as response:
+                if response.status_code in REDIRECTS:
+                    raise CliError(
+                        f"API redirect HTTP {response.status_code}",
+                        reason="api_redirect",
+                    )
+                if response.status_code != 200:
+                    raise CliError(
+                        f"API HTTP {response.status_code}",
+                        reason="api_failed",
+                        status_code=response.status_code,
+                    )
+                content = bytearray()
+                for chunk in response.iter_bytes():
+                    content.extend(chunk)
+                    if len(content) > MAX_PROBE_BYTES:
+                        raise CliError(
+                            "response exceeded 64 KiB limit",
+                            reason="response_oversized",
+                        )
+    except httpx.TransportError as exc:
+        raise CliError(
+            f"network error: {type(exc).__name__}", reason="network_error"
+        ) from exc
+
+    try:
+        payload = json.loads(content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CliError(
+            "API returned non-JSON response", reason="invalid_response"
+        ) from exc
+
+    if not isinstance(payload, dict):
+        raise CliError(
+            "API returned non-object JSON response", reason="invalid_response"
+        )
+
+    success_val = payload.get("success")
+    if success_val not in (1, True):
+        raise CliError(
+            "API returned unsuccessful response",
+            reason="api_failed",
+            stage="api_response",
+        )
+
+    domains = cfg.get("domains", {})
+    trust_status = "unverified"
+    if isinstance(domains, dict):
+        for d in domains.values():
+            if isinstance(d, dict) and normalize_origin(d.get("url", "")) == norm_url:
+                trust_status = d.get("trust", "unverified")
+                break
+
+    return {
+        "ok": True,
+        "base_url": norm_url,
+        "reachable": True,
+        "api_compatible": True,
+        "ownership_verified": False,
+        "trust": trust_status,
+        "credentials_sent": False,
+        "warnings": ["API compatibility does not prove Z-Library ownership."],
+    }
+
+
 def cmd_doctor(cfg: dict, args) -> None:
     account_arg = getattr(args, "account", None)
     if account_arg == "auto":
@@ -792,19 +1018,40 @@ def cmd_doctor(cfg: dict, args) -> None:
         raise CliError(
             "API health check failed", reason="api_failed", stage="api_response"
         )
+    norm_base = normalize_origin(cfg["base_url"])
+    domains = cfg.get("domains", {})
+    trust_status = "unverified"
+    if isinstance(domains, dict):
+        for d in domains.values():
+            if isinstance(d, dict) and normalize_origin(d.get("url", "")) == norm_base:
+                trust_status = d.get("trust", "unverified")
+                break
+
     result = {
         "ok": True,
         "base_url": cfg["base_url"],
         "proxy": "configured" if cfg.get("proxy") else "none",
         "authenticated": authenticated,
         "api_success": payload.get("success"),
+        "reachable": True,
+        "api_compatible": bool(payload.get("success") in (1, True)),
+        "ownership_verified": False,
+        "trust": trust_status,
     }
     if acc_name:
         result["account"] = acc_name
+    if acc_data and acc_data.get("session_origin"):
+        sess_orig = acc_data["session_origin"]
+        result["session_origin"] = sess_orig
+        result["session_origin_match"] = bool(normalize_origin(sess_orig) == norm_base)
+    else:
+        result["session_origin"] = None
+        result["session_origin_match"] = None
     emit(result)
 
 
 def cmd_login(cfg: dict, args) -> None:
+    require_trusted_origin(cfg)
     account_name = getattr(args, "account", None)
     if account_name:
         validate_account_name(account_name)
@@ -839,6 +1086,7 @@ def cmd_login(cfg: dict, args) -> None:
 
 
 def cmd_import_session(cfg: dict, args) -> None:
+    require_trusted_origin(cfg)
     account_name = getattr(args, "account", None)
     if account_name:
         validate_account_name(account_name)
@@ -867,6 +1115,7 @@ def cmd_import_session(cfg: dict, args) -> None:
 
 
 def cmd_register(cfg: dict, args) -> None:
+    require_trusted_origin(cfg)
     if getattr(args, "account", None) == "auto":
         raise CliError(
             "--account auto is not supported for register",
@@ -1148,6 +1397,149 @@ def cmd_accounts(cfg: dict, args) -> None:
         )
 
 
+def cmd_domains(cfg: dict, args) -> None:
+    sub = getattr(args, "domains_command", None)
+    if sub == "list":
+        stored = load_config()
+        active = normalize_origin(
+            cfg.get("base_url", stored.get("base_url", DEFAULT_BASE_URL))
+        )
+        domains_dict = stored.get("domains", {})
+        result_domains = []
+        for name in sorted(domains_dict.keys()):
+            d = domains_dict[name]
+            if isinstance(d, dict):
+                norm_u = normalize_origin(d.get("url", ""))
+                result_domains.append(
+                    {
+                        "name": name,
+                        "url": norm_u,
+                        "trust": d.get("trust", "unverified"),
+                        "source": d.get("source"),
+                        "verified_at": d.get("verified_at"),
+                        "is_active": (norm_u == active),
+                    }
+                )
+        emit(
+            {
+                "ok": True,
+                "active_origin": active,
+                "domains": result_domains,
+            }
+        )
+    elif sub == "check":
+        url = getattr(args, "url", None)
+        if not url:
+            raise CliError("missing --url", reason="invalid_arguments")
+        result = probe_domain(cfg, url)
+        emit(result)
+    elif sub == "add":
+        name = args.name
+        validate_account_name(name)
+        norm_url = validate_onion_origin(args.url)
+        target_host = urlparse(norm_url).hostname or ""
+        confirm_host = (args.confirm_host or "").strip().lower()
+        if confirm_host != target_host:
+            raise CliError(
+                "confirm-host does not match url hostname",
+                reason="confirmation_mismatch",
+            )
+        verified_from = (args.verified_from or "").strip()
+        if not verified_from:
+            raise CliError(
+                "verified-from source URL required", reason="source_required"
+            )
+        parsed_src = urlparse(verified_from)
+        if (
+            parsed_src.username is not None
+            or parsed_src.password is not None
+            or "@" in parsed_src.netloc
+        ):
+            raise CliError(
+                "source URL must not contain credentials", reason="invalid_source"
+            )
+        if parsed_src.scheme not in {"http", "https"}:
+            raise CliError(
+                "source URL must use http:// or https://", reason="invalid_source"
+            )
+
+        now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+        def updater(stored: dict) -> None:
+            domains = stored.setdefault("domains", {})
+            if name in domains:
+                raise CliError(
+                    f"domain alias '{name}' already exists", reason="domain_exists"
+                )
+            for existing_name, d in domains.items():
+                if (
+                    isinstance(d, dict)
+                    and normalize_origin(d.get("url", "")) == norm_url
+                ):
+                    raise CliError(
+                        f"origin already registered under alias '{existing_name}'",
+                        reason="domain_exists",
+                    )
+            domains[name] = {
+                "url": norm_url,
+                "trust": "user_verified",
+                "source": verified_from,
+                "verified_at": now_iso,
+            }
+
+        update_config(updater)
+        emit(
+            {
+                "ok": True,
+                "name": name,
+                "url": norm_url,
+                "trust": "user_verified",
+                "config": str(config_path()),
+            }
+        )
+    elif sub == "use":
+        name = args.name
+        validate_account_name(name)
+
+        def updater(stored: dict) -> None:
+            domains = stored.get("domains", {})
+            if name not in domains:
+                raise CliError(f"domain '{name}' not found", reason="domain_not_found")
+            stored["base_url"] = domains[name]["url"]
+
+        updated = update_config(updater)
+        emit(
+            {
+                "ok": True,
+                "name": name,
+                "base_url": updated["base_url"],
+            }
+        )
+    elif sub == "remove":
+        name = args.name
+        validate_account_name(name)
+
+        def updater(stored: dict) -> None:
+            domains = stored.get("domains", {})
+            if name not in domains:
+                raise CliError(f"domain '{name}' not found", reason="domain_not_found")
+            active_url = normalize_origin(stored.get("base_url", DEFAULT_BASE_URL))
+            target_url = normalize_origin(domains[name].get("url", ""))
+            if target_url == active_url:
+                raise CliError(
+                    "cannot remove active domain in use", reason="domain_in_use"
+                )
+            domains.pop(name, None)
+
+        update_config(updater)
+        emit(
+            {
+                "ok": True,
+                "removed": name,
+            }
+        )
+
+
 def safe_filename(value: str) -> str:
     cleaned = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", value).strip(" .")
     cleaned = cleaned[:140].rstrip(" .") or "book"
@@ -1168,7 +1560,11 @@ def download_stream(cfg: dict, url: str, output: Path, max_bytes: int) -> int:
     for hop in range(MAX_REDIRECTS + 1):
         same_origin = origin(current) == origin(cfg["base_url"])
         validate_target(current, allow_http_onion=same_origin)
-        headers, cookies = auth(cfg) if same_origin else ({}, {})
+        if same_origin:
+            require_trusted_origin(cfg)
+            headers, cookies = auth(cfg)
+        else:
+            headers, cookies = ({}, {})
         headers = {**headers, "Accept-Encoding": "identity"}
         with (
             client(cfg) as session,
@@ -1250,10 +1646,41 @@ def digest(path: Path) -> str:
         return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
-def cache_key(cfg: dict, args) -> str:
-    return hashlib.sha256(
-        f"{cfg['base_url']}\n{args.id}\n{args.hash}".encode()
-    ).hexdigest()
+def cache_key(*args, **kwargs) -> str:
+    if len(args) == 2 and isinstance(args[0], str) and isinstance(args[1], str):
+        book_id, book_hash = args[0], args[1]
+    elif len(args) >= 2 and hasattr(args[1], "id") and hasattr(args[1], "hash"):
+        book_id, book_hash = str(args[1].id), str(args[1].hash)
+    elif len(args) >= 1 and hasattr(args[0], "id") and hasattr(args[0], "hash"):
+        book_id, book_hash = str(args[0].id), str(args[0].hash)
+    else:
+        book_id = str(kwargs.get("id") or "")
+        book_hash = str(kwargs.get("hash") or "")
+    return hashlib.sha256(f"zlibrary\n{book_id}\n{book_hash}".encode()).hexdigest()
+
+
+def legacy_cache_keys(cfg: dict, book_id: str, book_hash: str) -> list[str]:
+    trusted_origins: list[str] = []
+    domains = cfg.get("domains")
+    if isinstance(domains, dict):
+        for d in domains.values():
+            if isinstance(d, dict) and d.get("trust") in {"builtin", "user_verified"}:
+                u = d.get("url")
+                if u:
+                    trusted_origins.append(u)
+                    trusted_origins.append(normalize_origin(u))
+    else:
+        trusted_origins.append(DEFAULT_BASE_URL)
+        trusted_origins.append(normalize_origin(DEFAULT_BASE_URL))
+
+    seen = set()
+    keys = []
+    for orig in trusted_origins:
+        k = hashlib.sha256(f"{orig}\n{book_id}\n{book_hash}".encode()).hexdigest()
+        if k not in seen:
+            seen.add(k)
+            keys.append(k)
+    return keys
 
 
 def cached_file(manifest: Path, output_dir: Path, max_bytes: int) -> Path | None:
@@ -1280,6 +1707,36 @@ def cached_file(manifest: Path, output_dir: Path, max_bytes: int) -> Path | None
     return None
 
 
+def find_cached_download(
+    cfg: dict, args, output_dir: Path, max_bytes: int
+) -> Path | None:
+    new_k = cache_key(args.id, args.hash)
+    new_manifest = output_dir / f".zlib-{new_k}.json"
+    cached = cached_file(new_manifest, output_dir, max_bytes)
+    if cached is not None:
+        return cached
+
+    for old_k in legacy_cache_keys(cfg, args.id, args.hash):
+        old_manifest = output_dir / f".zlib-{old_k}.json"
+        if old_manifest.is_file():
+            cached = cached_file(old_manifest, output_dir, max_bytes)
+            if cached is not None:
+                try:
+                    record = json.loads(old_manifest.read_text(encoding="utf-8"))
+                    fd, temp_name = tempfile.mkstemp(
+                        dir=output_dir, prefix=".zlib-", suffix=".tmp"
+                    )
+                    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                        json.dump(record, handle)
+                    Path(temp_name).replace(new_manifest)
+                    return cached
+                except Exception as exc:
+                    raise CliError(
+                        "cache migration failed", reason="cache_migration_failed"
+                    ) from exc
+    return None
+
+
 def cmd_download(cfg: dict, args) -> None:
     account_arg = getattr(args, "account", None)
     if account_arg == "auto" and args.force:
@@ -1290,7 +1747,7 @@ def cmd_download(cfg: dict, args) -> None:
 
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    key = cache_key(cfg, args)
+    key = cache_key(args.id, args.hash)
     book_lock = output_dir / f".zlib-{key}.lock"
 
     with exclusive_lock(
@@ -1299,9 +1756,8 @@ def cmd_download(cfg: dict, args) -> None:
         message="download already running; remove stale lock only after checking no process is active",
     ):
         # 1. Local cache check
-        manifest = output_dir / f".zlib-{key}.json"
         max_bytes = args.max_mb * 1024 * 1024
-        existing = cached_file(manifest, output_dir, max_bytes)
+        existing = find_cached_download(cfg, args, output_dir, max_bytes)
         if existing and not args.force:
             emit(
                 {
@@ -1325,6 +1781,7 @@ def cmd_download(cfg: dict, args) -> None:
             active_cfg = dict(cfg)
             active_cfg["accounts"] = fresh_cfg.get("accounts", {})
             active_cfg["default_account"] = fresh_cfg.get("default_account")
+            active_cfg["domains"] = fresh_cfg.get("domains", {})
 
             if account_arg == "auto":
                 acc_name, acc_data = select_download_account(active_cfg)
@@ -1358,10 +1815,10 @@ def download_locked(
     account_name: str | None = None,
     selection: str | None = None,
 ) -> None:
-    key = cache_key(cfg, args)
+    key = cache_key(args.id, args.hash)
     manifest = output_dir / f".zlib-{key}.json"
     max_bytes = args.max_mb * 1024 * 1024
-    existing = cached_file(manifest, output_dir, max_bytes)
+    existing = find_cached_download(cfg, args, output_dir, max_bytes)
     if existing and not args.force:
         emit(
             {
@@ -1372,6 +1829,7 @@ def download_locked(
             }
         )
         return
+    require_trusted_origin(cfg)
     if not auth(cfg)[0]:
         raise CliError("download requires a session; run login or import-session")
     payload = request_json(
@@ -1508,6 +1966,21 @@ def parser() -> argparse.ArgumentParser:
     acc_remove = acc_sub.add_parser("remove")
     acc_remove.add_argument("name")
 
+    domains = commands.add_parser("domains")
+    dom_sub = domains.add_subparsers(dest="domains_command", required=True)
+    dom_sub.add_parser("list")
+    dom_check = dom_sub.add_parser("check")
+    dom_check.add_argument("--url", required=True)
+    dom_add = dom_sub.add_parser("add")
+    dom_add.add_argument("name")
+    dom_add.add_argument("--url", required=True)
+    dom_add.add_argument("--verified-from", required=True)
+    dom_add.add_argument("--confirm-host", required=True)
+    dom_use = dom_sub.add_parser("use")
+    dom_use.add_argument("name")
+    dom_remove = dom_sub.add_parser("remove")
+    dom_remove.add_argument("name")
+
     return root
 
 
@@ -1521,6 +1994,7 @@ COMMANDS = {
     "search": cmd_search,
     "download": cmd_download,
     "accounts": cmd_accounts,
+    "domains": cmd_domains,
 }
 
 
@@ -1534,6 +2008,13 @@ def main() -> int:
             and getattr(args, "accounts_command", "") in {"use", "remove", "list"}
             and not getattr(args, "refresh", False)
         ):
+            COMMANDS[args.command](load_config(), args)
+        elif args.command == "domains" and getattr(args, "domains_command", "") in {
+            "use",
+            "remove",
+            "list",
+            "add",
+        }:
             COMMANDS[args.command](load_config(), args)
         else:
             COMMANDS[args.command](settings(), args)

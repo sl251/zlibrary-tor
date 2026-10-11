@@ -197,6 +197,29 @@ python scripts/zlibrary_tor.py accounts use personal
 python scripts/zlibrary_tor.py accounts remove old_account
 ```
 
+### domains: manage onion origins and mirrors
+
+```bash
+# List configured origins, trust levels, and verification status
+python scripts/zlibrary_tor.py domains list
+
+# Check an unverified candidate onion via uncredentialed GET /eapi/info
+python scripts/zlibrary_tor.py domains check --url "http://<candidate>.onion"
+
+# Add an onion origin after human verification of official source and explicit host confirmation
+python scripts/zlibrary_tor.py domains add backup \
+  --url "http://<verified>.onion" \
+  --verified-from "https://official-announcement-url" \
+  --confirm-host "<verified>.onion"
+
+# Switch active base origin without migrating any session tokens
+python scripts/zlibrary_tor.py domains use backup
+
+# Remove an unneeded mirror (active origin cannot be removed)
+python scripts/zlibrary_tor.py domains remove backup
+```
+
+Candidate probing is uncredentialed and does not grant trust or verify ownership. Adding a domain requires explicit human verification and confirmation; candidate source URLs are never fetched automatically. Switching domains never migrates credentials or forwards sessions.
 
 ### Automation and reliable downloads
 

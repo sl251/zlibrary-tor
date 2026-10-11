@@ -29,14 +29,15 @@ The default configuration is `~/.config/zlibrary-tor/config.json` (or `%APPDATA%
 
 On restricted networks, the configured proxy must still be a Tor SOCKS listener. If Tor itself needs a conventional upstream proxy, configure Tor with `HTTPSProxy proxy-host:port` or `Socks5Proxy proxy-host:port`, matching the user's actual proxy protocol. Do not point this skill directly at a conventional proxy and assume it can resolve onion services.
 
-## Account selection and verification
+## Account selection and domain verification
 
 - `--account auto` is an explicit pre-request selection mechanism evaluated before any download link is requested.
 - Stop immediately when quota fields are unknown or unverified; do not guess remaining limits or assume quota exhaustion.
 - Never rotate accounts or switch hosts once a download link request has begun.
-- Candidate health checks never convey trust or authorize sending credentials.
-- Add domains or accounts only after human verification of the official source.
-- Switching domains never migrates or forwards active session tokens.
+- Candidate health checks (`domains check`) are uncredentialed GET `/eapi/info` probes and never convey trust or authorize sending credentials.
+- Add domains (`domains add`) only after human verification of the official source and explicit host confirmation; the source URL is not automatically fetched.
+- Switching domains (`domains use`) never migrates or forwards active session tokens; untrusted origins block all authentication requests with zero network.
+- Verified downloads are cached cross-origin under service-level keys, returning `status: cached` without consuming extra download limits.
 
 
 ## Account creation
