@@ -82,9 +82,9 @@ python scripts/zlibrary_tor.py doctor
 python scripts/zlibrary_tor.py login --email you@example.com
 ```
 
-The password prompt hides input, and the password is never written anywhere. Only the session values (`remix_userid` / `remix_userkey`) and origin binding are saved, to `~/.config/zlibrary-tor/config.json` by default; override the location with `ZLIBRARY_TOR_CONFIG`. Use `--account NAME` to save credentials under a specific alias (defaults to `default`).
+The password prompt hides input, and the password is never written anywhere. Only the session values (`remix_userid` / `remix_userkey`) and origin binding are saved, to `~/.config/zlibrary-tor/config.json` by default; override the location with `ZLIBRARY_TOR_CONFIG`. Use `--account NAME` to save credentials under a specific alias. Without it, login replaces the current default account session; if no default is set, it saves to `default` and selects it.
 
-Already logged in via Tor Browser? Run `import-session` (optionally `--account NAME`) and paste the two remix values from the browser instead of typing your password again.
+Already logged in via Tor Browser? Run `import-session` (optionally `--account NAME`) and paste the two remix values from the browser instead of typing your password again. Environment import requires the complete `ZLIBRARY_REMIX_USERID`, `ZLIBRARY_REMIX_USERKEY`, and `ZLIBRARY_SESSION_ORIGIN` group, with an origin matching the current trusted target; partial groups are rejected without prompting.
 
 ### profile: account info and daily download quota
 
@@ -106,9 +106,10 @@ python scripts/zlibrary_tor.py profile --account NAME
   "account": "default",
   "quota": {
     "status": "available",
-    "downloads_today": 0,
-    "downloads_limit": 10,
-    "remaining": 10
+    "used": 0,
+    "limit": 10,
+    "remaining": 10,
+    "checked_at": "2026-10-11T00:00:00Z"
   }
 }
 ```
@@ -161,7 +162,9 @@ python scripts/zlibrary_tor.py download --id 26610712 --hash def1ec --account au
 }
 ```
 
-`--output-dir` sets the save directory (default `downloads`), `--max-mb` caps the size (default 80 MB, max 512). `--account auto` evaluates confirmed remaining quotas before requesting a download link, stopping immediately if quota is exhausted or unverified without retrying or switching mid-stream. `--force` explicitly replaces a cached file but cannot be combined with `--account auto`.
+`--output-dir` sets the save directory (default `downloads`), `--max-mb` caps the size (default 80 MB, max 512). `--account auto` evaluates confirmed remaining quotas before requesting a download link. An exhausted candidate is skipped so the next candidate can be checked; unknown quota or a rate limit stops selection. Once a link request starts, failures stop the download without retrying or switching accounts or origins. `--force` explicitly replaces a cached file but cannot be combined with `--account auto`.
+
+The coordination lock covers downloads using this configuration on this machine. It does not coordinate browser downloads, other configuration files, or other machines, and profile quota checks do not reserve quota. Stop older download processes before upgrading so they cannot bypass the new lock.
 
 The normal flow: you pick a book from the search results, and the agent downloads it using that book's `id` and `hash`.
 

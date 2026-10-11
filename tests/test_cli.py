@@ -13,19 +13,39 @@ import pytest
 import zlibrary_tor as cli
 
 
-@pytest.fixture
-def cfg(monkeypatch, tmp_path):
+@pytest.fixture(autouse=True)
+def isolated_config_environment(monkeypatch, tmp_path):
     for key in list(cli.os.environ):
         if key.startswith("ZLIBRARY_"):
             monkeypatch.delenv(key)
     monkeypatch.setenv("ZLIBRARY_TOR_CONFIG", str(tmp_path / "config.json"))
-    return {
-        "base_url": cli.DEFAULT_BASE_URL,
-        "proxy": cli.DEFAULT_PROXY,
-        "remix_userid": "123",
-        "remix_userkey": "private-key",
-        "retries": 1,
-    }
+
+    def forbid_live_http(*args, **kwargs):
+        pytest.fail("tests must use an offline HTTP transport")
+
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", forbid_live_http)
+
+
+@pytest.fixture
+def cfg():
+    config = cli.normalize_config(
+        {
+            "schema_version": 2,
+            "base_url": cli.DEFAULT_BASE_URL,
+            "proxy": cli.DEFAULT_PROXY,
+            "accounts": {
+                "default": {
+                    "remix_userid": "123",
+                    "remix_userkey": "private-key",
+                    "session_origin": cli.DEFAULT_BASE_URL,
+                }
+            },
+            "default_account": "default",
+            "retries": 1,
+        }
+    )
+    cli.save_config(config)
+    return cli.account_settings(config, "default", config["accounts"]["default"])
 
 
 def mock_network(monkeypatch, handler):
@@ -62,6 +82,8 @@ def test_explicit_password_stdin(cfg, monkeypatch):
 def test_import_and_logout(cfg, monkeypatch, capsys):
     monkeypatch.setenv("ZLIBRARY_REMIX_USERID", "123")
     monkeypatch.setenv("ZLIBRARY_REMIX_USERKEY", "private-key")
+    monkeypatch.setenv("ZLIBRARY_SESSION_ORIGIN", cli.DEFAULT_BASE_URL)
+    monkeypatch.setattr(cli, "client", lambda _: pytest.fail("import must be offline"))
     cli.cmd_import_session(cfg, None)
     assert cli.load_config()["accounts"]["default"]["remix_userkey"] == "private-key"
     cli.cmd_logout({}, None)
@@ -177,7 +199,7 @@ def test_cache_before_quota_and_corruption(cfg, monkeypatch, tmp_path, capsys):
     output.write_bytes(b"fake")
     assert (
         cli.cached_file(
-            tmp_path / f".zlib-{cli.cache_key(cfg, args)}.json", tmp_path, 1024
+            tmp_path / f".zlib-{cli.cache_key(args.id, args.hash)}.json", tmp_path, 1024
         )
         is None
     )
@@ -270,7 +292,7 @@ def test_invalid_arguments(args):
 
 def test_lock_prevents_second_link(cfg, monkeypatch, tmp_path):
     args = download_args(tmp_path)
-    (tmp_path / f".zlib-{cli.cache_key(cfg, args)}.lock").touch()
+    (tmp_path / f".zlib-{cli.cache_key(args.id, args.hash)}.lock").touch()
 
     def unexpected(_):
         pytest.fail("locked download must not access network")
@@ -1136,7 +1158,16 @@ def test_auto_skips_explicitly_invalid_session_before_link(tmp_path, monkeypatch
         encoding="utf-8",
     )
 
+    calls = []
+
     def handler(request):
+        calls.append(
+            (
+                cli.normalize_origin(str(request.url)),
+                request.headers.get("remix-userid"),
+                request.url.path,
+            )
+        )
         path = request.url.path
         if "/user/profile" in path:
             uid = request.headers.get("remix-userid")
@@ -1168,6 +1199,13 @@ def test_auto_skips_explicitly_invalid_session_before_link(tmp_path, monkeypatch
     mock_network(monkeypatch, handler)
     args = download_args(tmp_path, account="auto")
     cli.cmd_download(cli.settings(), args)
+
+    assert calls == [
+        (cli.DEFAULT_BASE_URL, "1", "/eapi/user/profile"),
+        (cli.DEFAULT_BASE_URL, "2", "/eapi/user/profile"),
+        (cli.DEFAULT_BASE_URL, "2", "/eapi/book/123/abcdef/file"),
+        (cli.DEFAULT_BASE_URL, "2", "/download"),
+    ]
 
 
 def test_auto_does_not_classify_generic_403_as_expired(tmp_path, monkeypatch):
@@ -1300,7 +1338,20 @@ def test_explicit_account_never_falls_back(tmp_path, monkeypatch):
     assert calls == ["1"]
 
 
-def test_link_failure_never_switches_account_or_domain(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "failure,reason",
+    [
+        ("500", "api_http_error"),
+        ("503", "api_http_error"),
+        ("quota", "daily_quota_exhausted"),
+        ("timeout", "network_error"),
+        ("transport", "network_error"),
+        ("429", "rate_limited"),
+    ],
+)
+def test_link_failure_never_switches_account_or_domain(
+    tmp_path, monkeypatch, failure, reason
+):
     cfg_file = tmp_path / "config.json"
     monkeypatch.setenv("ZLIBRARY_TOR_CONFIG", str(cfg_file))
     cfg_file.write_text(
@@ -1324,10 +1375,16 @@ def test_link_failure_never_switches_account_or_domain(tmp_path, monkeypatch):
         ),
         encoding="utf-8",
     )
-    link_attempts = 0
+    calls = []
 
     def handler(request):
-        nonlocal link_attempts
+        calls.append(
+            (
+                cli.normalize_origin(str(request.url)),
+                request.headers.get("remix-userid"),
+                request.url.path,
+            )
+        )
         if "/user/profile" in request.url.path:
             return httpx.Response(
                 200,
@@ -1337,15 +1394,28 @@ def test_link_failure_never_switches_account_or_domain(tmp_path, monkeypatch):
                 },
             )
         if "/file" in request.url.path:
-            link_attempts += 1
-            return httpx.Response(500, json={"error": "server error"})
+            if failure == "timeout":
+                raise httpx.ReadTimeout("private failure detail", request=request)
+            if failure == "transport":
+                raise httpx.ConnectError("private failure detail", request=request)
+            if failure == "quota":
+                return httpx.Response(
+                    200, json={"success": 0, "error": "Daily download limit reached"}
+                )
+            return httpx.Response(int(failure), json={"error": "server error"})
         return httpx.Response(404)
 
     mock_network(monkeypatch, handler)
     args = download_args(tmp_path, account="auto")
-    with pytest.raises(cli.CliError):
+    with pytest.raises(cli.CliError) as caught:
         cli.cmd_download(cli.settings(), args)
-    assert link_attempts == 1
+    assert caught.value.reason == reason
+    assert calls == [
+        (cli.DEFAULT_BASE_URL, "1", "/eapi/user/profile"),
+        (cli.DEFAULT_BASE_URL, "1", "/eapi/book/123/abcdef/file"),
+    ]
+    assert not list(tmp_path.glob("*.lock"))
+    assert not list(tmp_path.glob(".zlib-*.lock"))
 
 
 def test_auto_force_is_rejected(cfg):
@@ -1375,7 +1445,7 @@ def test_cache_precedes_profile_and_account_selection(tmp_path, monkeypatch, cap
         encoding="utf-8",
     )
     args = download_args(tmp_path, account="auto")
-    key = cli.cache_key(cli.settings(), args)
+    key = cli.cache_key(args.id, args.hash)
     book_file = tmp_path / "book.epub"
     book_file.write_bytes(b"cached book content")
     manifest = tmp_path / f".zlib-{key}.json"
@@ -1461,7 +1531,7 @@ def test_owned_locks_released_after_failure(tmp_path, monkeypatch):
         cli.cmd_download(cli.settings(), args)
 
     coord_lock = tmp_path / "config.json.download.lock"
-    book_lock = tmp_path / f".zlib-{cli.cache_key(cli.settings(), args)}.lock"
+    book_lock = tmp_path / f".zlib-{cli.cache_key(args.id, args.hash)}.lock"
     assert not coord_lock.exists()
     assert not book_lock.exists()
 
@@ -2159,9 +2229,23 @@ def test_trusted_backup_redirect_still_receives_no_session(tmp_path, monkeypatch
     assert "cookie" not in requests[1].headers
 
 
-def test_tls_verification_is_not_disabled():
-    c = cli.client({})
-    assert getattr(c, "_transport", None) is not None
+def test_tls_verification_is_not_disabled(monkeypatch):
+    production_client = httpx.Client
+    construction = []
+
+    def observe(**kwargs):
+        construction.append(kwargs)
+        return production_client(**kwargs)
+
+    monkeypatch.setattr(cli.httpx, "Client", observe)
+    with cli.client({"proxy": cli.DEFAULT_PROXY, "timeout": 30}) as session:
+        assert session.follow_redirects is False
+    assert len(construction) == 1
+    assert construction[0].get("verify", True) is True
+    assert construction[0]["trust_env"] is False
+    assert construction[0]["follow_redirects"] is False
+    assert construction[0]["proxy"] == cli.DEFAULT_PROXY
+    assert construction[0]["timeout"].read == 30
 
 
 def test_cross_account_cache_reuse(tmp_path, monkeypatch, capsys):
@@ -2542,3 +2626,791 @@ def test_b1_to_b9_acceptance_suite(tmp_path, monkeypatch, capsys):
             ),
         )
     assert exc_b9.value.reason == "untrusted_origin"
+
+
+# Final review regressions: all sessions and requests below are offline fixtures.
+def request_identity(request):
+    return (
+        cli.normalize_origin(str(request.url)),
+        request.headers.get("remix-userid"),
+        request.url.path,
+    )
+
+
+def save_review_accounts(cfg, *, missing_origin=False):
+    config = cli.normalize_config(cfg)
+    first = dict(config["accounts"]["default"])
+    second = dict(first, remix_userid="456", remix_userkey="second-key")
+    if missing_origin:
+        first.pop("session_origin")
+    config["accounts"] = {"a": first, "b": second}
+    config["default_account"] = "a"
+    cli.save_config(config)
+    return cli.settings()
+
+
+@pytest.mark.parametrize("origin", [None, ""])
+def test_auth_rejects_missing_session_origin_before_network(cfg, monkeypatch, origin):
+    cfg["session_origin"] = origin
+    monkeypatch.setattr(
+        cli, "client", lambda _: pytest.fail("unbound auth went online")
+    )
+    with pytest.raises(cli.CliError) as caught:
+        cli.request_json(cfg, "GET", "/eapi/user/profile", authenticated=True)
+    assert caught.value.reason == "session_origin_mismatch"
+
+
+def test_refresh_missing_origin_sends_no_account_credentials(cfg, monkeypatch, capsys):
+    config = save_review_accounts(cfg, missing_origin=True)
+    calls = []
+
+    def handler(request):
+        calls.append(request_identity(request))
+        return httpx.Response(
+            200,
+            json={"success": 1, "user": {"downloads_today": 0, "downloads_limit": 5}},
+        )
+
+    mock_network(monkeypatch, handler)
+    cli.cmd_accounts(config, SimpleNamespace(accounts_command="list", refresh=True))
+    result = json.loads(capsys.readouterr().out)
+    assert result["accounts"][0]["quota"]["status"] == "session_origin_mismatch"
+    assert calls == [(cli.DEFAULT_BASE_URL, "456", "/eapi/user/profile")]
+
+
+def test_v2_top_level_credentials_cannot_create_bound_account(monkeypatch):
+    config = cli.normalize_config(
+        {
+            "schema_version": 2,
+            "remix_userid": "unbound-id",
+            "remix_userkey": "unbound-key",
+        }
+    )
+    monkeypatch.setattr(
+        cli, "client", lambda _: pytest.fail("unbound session went online")
+    )
+    with pytest.raises(cli.CliError) as caught:
+        cli.cmd_profile(config, None)
+    assert caught.value.reason == "account_required"
+    assert config["accounts"] == {}
+
+
+@pytest.mark.parametrize(
+    "env,reason",
+    [
+        ({"ZLIBRARY_REMIX_USERID": "import-id"}, "incomplete_environment_session"),
+        ({"ZLIBRARY_REMIX_USERKEY": "import-key"}, "incomplete_environment_session"),
+        (
+            {
+                "ZLIBRARY_REMIX_USERID": "import-id",
+                "ZLIBRARY_REMIX_USERKEY": "import-key",
+            },
+            "session_origin_missing",
+        ),
+        ({"ZLIBRARY_SESSION_ORIGIN": cli.DEFAULT_BASE_URL}, "account_required"),
+        (
+            {
+                "ZLIBRARY_REMIX_USERID": "import-id",
+                "ZLIBRARY_REMIX_USERKEY": "import-key",
+                "ZLIBRARY_SESSION_ORIGIN": "https://example.org",
+            },
+            "session_origin_mismatch",
+        ),
+    ],
+)
+def test_environment_import_requires_complete_matching_group(
+    cfg, monkeypatch, env, reason, capsys
+):
+    before = cli.config_path().read_bytes()
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(
+        cli,
+        "secret",
+        lambda *a, **kw: pytest.fail("partial environment import prompted"),
+    )
+    monkeypatch.setattr(cli, "client", lambda _: pytest.fail("import went online"))
+    with pytest.raises(cli.CliError) as caught:
+        cli.cmd_import_session(cfg, SimpleNamespace(account="imported"))
+    assert caught.value.reason == reason
+    assert cli.config_path().read_bytes() == before
+    assert not capsys.readouterr().out
+
+
+def test_environment_import_preserves_matching_origin_offline(cfg, monkeypatch, capsys):
+    monkeypatch.setenv("ZLIBRARY_REMIX_USERID", "import-id")
+    monkeypatch.setenv("ZLIBRARY_REMIX_USERKEY", "import-key")
+    monkeypatch.setenv("ZLIBRARY_SESSION_ORIGIN", cli.DEFAULT_BASE_URL.upper() + ":80")
+    monkeypatch.setattr(
+        cli, "secret", lambda *a, **kw: pytest.fail("environment import prompted")
+    )
+    monkeypatch.setattr(cli, "client", lambda _: pytest.fail("import went online"))
+    cli.cmd_import_session(cfg, SimpleNamespace(account="imported"))
+    imported = cli.load_config()["accounts"]["imported"]
+    assert imported == {
+        "remix_userid": "import-id",
+        "remix_userkey": "import-key",
+        "session_origin": cli.DEFAULT_BASE_URL,
+    }
+    assert "import-key" not in capsys.readouterr().out
+
+
+def test_interactive_import_uses_two_hidden_inputs_offline(cfg, monkeypatch, capsys):
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
+    prompts = []
+    values = iter(["browser-id", "browser-key"])
+
+    def hidden_input(prompt):
+        prompts.append(prompt)
+        return next(values)
+
+    monkeypatch.setattr(cli.getpass, "getpass", hidden_input)
+    monkeypatch.setattr(cli, "client", lambda _: pytest.fail("import went online"))
+    cli.cmd_import_session(cfg, SimpleNamespace(account="browser"))
+    assert prompts == ["remix_userid: ", "remix_userkey: "]
+    assert (
+        cli.load_config()["accounts"]["browser"]["session_origin"]
+        == cli.DEFAULT_BASE_URL
+    )
+    assert "browser-key" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "https://example.org/announcement?token=SOURCE_SECRET_MARKER",
+        "https://example.org/announcement#access_token=SOURCE_SECRET_MARKER",
+        "https://SOURCE_SECRET_MARKER@example.org/announcement",
+        "https:///SOURCE_SECRET_MARKER",
+        "https://bad_host.example/SOURCE_SECRET_MARKER",
+        "http://localhost/SOURCE_SECRET_MARKER",
+        "http://127.0.0.1/SOURCE_SECRET_MARKER",
+        "https://[::1]/SOURCE_SECRET_MARKER",
+        "https://example.internal/SOURCE_SECRET_MARKER",
+        "https://example.org:bad/SOURCE_SECRET_MARKER",
+        "ftp://example.org/SOURCE_SECRET_MARKER",
+        "https://example.org/?",
+        "https://example.org/#",
+        "https://127.1/source",
+        "http://224.0.0.1/SOURCE_SECRET_MARKER",
+        "https://localhost./SOURCE_SECRET_MARKER",
+        "https://example.internal./SOURCE_SECRET_MARKER",
+    ],
+)
+def test_verification_source_rejects_nonpublic_or_secret_urls_without_leak(
+    cfg, monkeypatch, capsys, source
+):
+    before = cli.config_path().read_bytes()
+    target_host = make_v3_onion(b"s" * 32)
+    monkeypatch.setattr(
+        cli, "client", lambda _: pytest.fail("source must not be fetched")
+    )
+    with pytest.raises(cli.CliError) as caught:
+        cli.cmd_domains(
+            cfg,
+            SimpleNamespace(
+                domains_command="add",
+                name="backup",
+                url=f"http://{target_host}",
+                confirm_host=target_host,
+                verified_from=source,
+            ),
+        )
+    assert caught.value.reason == "invalid_source"
+    assert "SOURCE_SECRET_MARKER" not in str(caught.value)
+    assert cli.config_path().read_bytes() == before
+    cli.cmd_domains(cfg, SimpleNamespace(domains_command="list"))
+    assert "SOURCE_SECRET_MARKER" not in capsys.readouterr().out
+    assert "SOURCE_SECRET_MARKER" not in cli.config_path().read_text()
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "http://example.org/announcement",
+        "https://example.org/announcement",
+        "https://8.8.8.8/announcement",
+    ],
+)
+def test_verification_source_accepts_public_http_urls(source):
+    cli.validate_verification_source(source)
+
+
+@pytest.mark.parametrize(
+    "status,reason",
+    [(401, "session_invalid"), (403, "profile_failed"), (429, "rate_limited")],
+)
+@pytest.mark.parametrize(
+    "body", [b"<html>gateway error</html>", b"", b"[]", b"null", b"1"]
+)
+def test_http_auth_and_rate_limit_classification_precedes_json(
+    cfg, monkeypatch, status, reason, body
+):
+    calls = []
+
+    def handler(request):
+        calls.append(request_identity(request))
+        return httpx.Response(status, content=body)
+
+    mock_network(monkeypatch, handler)
+    with pytest.raises(cli.CliError) as caught:
+        cli.fetch_profile(cfg)
+    assert caught.value.reason == reason
+    assert caught.value.status_code == status
+    assert calls == [(cli.DEFAULT_BASE_URL, "123", "/eapi/user/profile")]
+
+
+@pytest.mark.parametrize("body", [b"<html>rate limit</html>", b"", b"[]"])
+@pytest.mark.parametrize("command", ["refresh", "auto"])
+def test_nonjson_429_stops_before_next_account(
+    cfg, monkeypatch, capsys, tmp_path, body, command
+):
+    config = save_review_accounts(cfg)
+    calls = []
+
+    def handler(request):
+        calls.append(request_identity(request))
+        return httpx.Response(429, content=body)
+
+    mock_network(monkeypatch, handler)
+    if command == "refresh":
+        cli.cmd_accounts(config, SimpleNamespace(accounts_command="list", refresh=True))
+        result = json.loads(capsys.readouterr().out)
+        assert len(result["accounts"]) == 1
+        assert result["accounts"][0]["quota"]["status"] == "rate_limited"
+    else:
+        with pytest.raises(cli.CliError) as caught:
+            cli.cmd_download(config, download_args(tmp_path, account="auto"))
+        assert caught.value.reason == "rate_limited"
+    assert calls == [(cli.DEFAULT_BASE_URL, "123", "/eapi/user/profile")]
+
+
+def test_autouse_fixture_isolates_settings_from_user_config(tmp_path):
+    assert cli.config_path() == tmp_path / "config.json"
+    assert not cli.config_path().exists()
+    assert {key for key in cli.os.environ if key.startswith("ZLIBRARY_")} == {
+        "ZLIBRARY_TOR_CONFIG"
+    }
+    assert cli.settings()["accounts"] == {}
+    assert not cli.config_path().exists()
+
+
+@pytest.mark.parametrize(
+    "raw_origin",
+    [
+        cli.DEFAULT_BASE_URL + ":80",
+        cli.DEFAULT_BASE_URL.upper(),
+        cli.DEFAULT_BASE_URL.upper() + ":80/",
+    ],
+)
+@pytest.mark.parametrize("version", [None, 2])
+def test_legacy_raw_base_url_cache_reused_after_domain_switch(
+    tmp_path, monkeypatch, capsys, raw_origin, version
+):
+    raw = {"base_url": raw_origin}
+    if version is not None:
+        raw["schema_version"] = version
+    cli.config_path().write_text(json.dumps(raw))
+    old_key = hashlib.sha256(f"{raw_origin}\n123\nabcdef".encode()).hexdigest()
+    book = tmp_path / "old.epub"
+    book.write_bytes(b"verified old cached book")
+    manifest = tmp_path / f".zlib-{old_key}.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "name": book.name,
+                "bytes": book.stat().st_size,
+                "sha256": cli.digest(book),
+            }
+        )
+    )
+    target_host = make_v3_onion(b"c" * 32)
+    cli.cmd_domains(
+        cli.settings(),
+        SimpleNamespace(
+            domains_command="add",
+            name="backup",
+            url=f"http://{target_host}",
+            confirm_host=target_host,
+            verified_from="https://example.org/announcement",
+        ),
+    )
+    cli.cmd_domains(
+        cli.settings(), SimpleNamespace(domains_command="use", name="backup")
+    )
+    capsys.readouterr()
+    assert raw_origin in cli.load_config()["legacy_base_urls"]
+    monkeypatch.setattr(cli, "client", lambda _: pytest.fail("cache hit went online"))
+    cli.cmd_download(cli.settings(), download_args(tmp_path, account="does_not_exist"))
+    assert json.loads(capsys.readouterr().out)["status"] == "cached"
+    assert (tmp_path / f".zlib-{cli.cache_key('123', 'abcdef')}.json").is_file()
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        {"schema_version": "2"},
+        {"schema_version": None},
+        {"schema_version": {}},
+        {"schema_version": True},
+        {"base_url": {}},
+        {"proxy": None},
+        {"timeout": "45"},
+        {"timeout": True},
+        {"timeout": float("nan")},
+        {"retries": 1.0},
+        {"retries": False},
+        {"retries": -1},
+        {"accounts": []},
+        {"accounts": {"auto": {}}},
+        {"accounts": {"a": []}},
+        {"accounts": {"a": {"remix_userid": 1}}},
+        {"accounts": {"a": {"remix_userkey": None}}},
+        {"accounts": {"a": {"session_origin": {}}}},
+        {"default_account": 1},
+        {"default_account": "absent"},
+        {"base_url": "http://example.org:bad"},
+        {"legacy_base_urls": {}},
+        {"legacy_base_urls": [1]},
+        {"domains": {"a": {"url": "https://example.org", "trust": []}}},
+    ],
+)
+def test_invalid_config_field_types_preserve_original_file(monkeypatch, patch, capsys):
+    raw = {"schema_version": 2, **patch}
+    before = json.dumps(raw).encode()
+    cli.config_path().write_bytes(before)
+    monkeypatch.setattr(
+        cli, "client", lambda _: pytest.fail("invalid config went online")
+    )
+    monkeypatch.setattr(cli.sys, "argv", ["zlibrary-tor", "accounts", "list"])
+    assert cli.main() == 1
+    assert json.loads(capsys.readouterr().out)["reason"] == "invalid_config"
+    assert cli.config_path().read_bytes() == before
+    assert not cli.config_path().with_suffix(".json.lock").exists()
+
+
+@pytest.mark.parametrize(
+    "trust,name",
+    [
+        ("legacy_unverified", "custom"),
+        ("legacy_unverified", "backup"),
+        ("custom", "custom"),
+    ],
+)
+def test_domain_add_atomically_upgrades_existing_unverified_record(
+    cfg, monkeypatch, capsys, trust, name
+):
+    target_host = make_v3_onion(b"u" * 32)
+    target = f"http://{target_host}"
+    config = cli.load_config()
+    config["base_url"] = target
+    config["domains"]["custom"] = {
+        "url": target,
+        "trust": trust,
+        "source": "legacy-config",
+        "verified_at": None,
+    }
+    cli.save_config(config)
+    args = SimpleNamespace(
+        domains_command="add",
+        name=name,
+        url=target,
+        confirm_host=target_host,
+        verified_from="https://example.org/announcement",
+    )
+    monkeypatch.setattr(cli, "client", lambda _: pytest.fail("upgrade went online"))
+    cli.cmd_domains(cli.settings(), args)
+    upgraded = cli.load_config()
+    assert upgraded["domains"][name]["trust"] == "user_verified"
+    assert upgraded["domains"][name]["source"] == args.verified_from
+    assert upgraded["domains"][name]["verified_at"]
+    assert upgraded["accounts"] == config["accounts"]
+    assert upgraded["base_url"] == target
+    if name != "custom":
+        assert "custom" not in upgraded["domains"]
+    before = cli.config_path().read_bytes()
+    with pytest.raises(cli.CliError) as caught:
+        cli.cmd_domains(cli.settings(), args)
+    assert caught.value.reason == "domain_exists"
+    assert cli.config_path().read_bytes() == before
+    assert json.loads(capsys.readouterr().out)["trust"] == "user_verified"
+
+
+@pytest.mark.parametrize(
+    "confirm,source,reason",
+    [
+        ("wrong.onion", "https://example.org", "confirmation_mismatch"),
+        (None, "https://example.org", "confirmation_mismatch"),
+        ("match", "", "source_required"),
+        ("match", "https://example.org/?token=secret", "invalid_source"),
+    ],
+)
+def test_domain_upgrade_requires_full_evidence_and_confirmation(
+    cfg, confirm, source, reason
+):
+    target_host = make_v3_onion(b"u" * 32)
+    config = cli.load_config()
+    config["domains"]["custom"] = {
+        "url": f"http://{target_host}",
+        "trust": "legacy_unverified",
+    }
+    cli.save_config(config)
+    before = cli.config_path().read_bytes()
+    with pytest.raises(cli.CliError) as caught:
+        cli.cmd_domains(
+            config,
+            SimpleNamespace(
+                domains_command="add",
+                name="custom",
+                url=f"http://{target_host}",
+                confirm_host=target_host if confirm == "match" else confirm,
+                verified_from=source,
+            ),
+        )
+    assert caught.value.reason == reason
+    assert cli.config_path().read_bytes() == before
+
+
+@pytest.fixture
+def fake_proxy(monkeypatch):
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+    monkeypatch.setattr(cli.socket, "create_connection", lambda *a, **kw: Connection())
+
+
+@pytest.mark.parametrize("account", [None, "default", "env"])
+def test_doctor_reports_mismatched_session_without_credentials(
+    cfg, monkeypatch, capsys, fake_proxy, account
+):
+    config = cli.settings()
+    config["base_url"] = f"http://{make_v3_onion(b'd' * 32)}"
+    if account == "env":
+        monkeypatch.setenv("ZLIBRARY_REMIX_USERID", "env-id")
+        monkeypatch.setenv("ZLIBRARY_REMIX_USERKEY", "env-key")
+        monkeypatch.setenv("ZLIBRARY_SESSION_ORIGIN", cli.DEFAULT_BASE_URL)
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(200, json={"success": 1})
+
+    mock_network(monkeypatch, handler)
+    cli.cmd_doctor(config, SimpleNamespace(account=account))
+    result = json.loads(capsys.readouterr().out)
+    assert result["authenticated"] is True
+    assert result["session_origin_match"] is False
+    assert result["session_origin"] == cli.DEFAULT_BASE_URL
+    assert len(calls) == 1
+    assert calls[0].url.path == "/eapi/info"
+    assert "remix-userkey" not in calls[0].headers
+    assert "cookie" not in calls[0].headers
+
+
+@pytest.mark.parametrize("command", ["doctor", "probe"])
+@pytest.mark.parametrize("success", [1.0, "1", {"yes": True}, [1], None, False, 2])
+def test_health_checks_reject_noninteger_success(
+    cfg, monkeypatch, fake_proxy, command, success
+):
+    mock_network(monkeypatch, lambda _: httpx.Response(200, json={"success": success}))
+    with pytest.raises(cli.CliError) as caught:
+        if command == "doctor":
+            cli.cmd_doctor(cfg, None)
+        else:
+            cli.probe_domain(cfg, cli.DEFAULT_BASE_URL)
+    assert caught.value.reason == "api_failed"
+    assert caught.value.stage == "api_response"
+
+
+@pytest.mark.parametrize("command", ["doctor", "probe"])
+def test_health_checks_reject_oversized_stream_before_reading_rest(
+    cfg, monkeypatch, fake_proxy, command
+):
+    consumed = []
+
+    class Chunks(httpx.SyncByteStream):
+        def __iter__(self):
+            for index in range(4):
+                consumed.append(index)
+                yield b"x" * (32 * 1024)
+
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(200, stream=Chunks())
+
+    mock_network(monkeypatch, handler)
+    with pytest.raises(cli.CliError) as caught:
+        if command == "doctor":
+            cli.cmd_doctor(cfg, None)
+        else:
+            cli.probe_domain(cfg, cli.DEFAULT_BASE_URL)
+    assert caught.value.reason == "response_oversized"
+    assert consumed == [0, 1, 2]
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("cache_type", ["service", "legacy"])
+def test_untrusted_current_origin_cannot_reuse_or_migrate_cache(
+    cfg, monkeypatch, tmp_path, cache_type
+):
+    book = tmp_path / "cached.epub"
+    book.write_bytes(b"cached content")
+    key = (
+        cli.cache_key("123", "abcdef")
+        if cache_type == "service"
+        else hashlib.sha256(f"{cli.DEFAULT_BASE_URL}\n123\nabcdef".encode()).hexdigest()
+    )
+    manifest = tmp_path / f".zlib-{key}.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "name": book.name,
+                "bytes": book.stat().st_size,
+                "sha256": cli.digest(book),
+            }
+        )
+    )
+    config = cli.settings()
+    config["base_url"] = f"http://{make_v3_onion(b'n' * 32)}"
+    monkeypatch.setattr(
+        cli, "client", lambda _: pytest.fail("untrusted cache went online")
+    )
+    with pytest.raises(cli.CliError) as caught:
+        cli.cmd_download(config, download_args(tmp_path, account="does_not_exist"))
+    assert caught.value.reason == "untrusted_origin"
+    if cache_type == "legacy":
+        assert not (tmp_path / f".zlib-{cli.cache_key('123', 'abcdef')}.json").exists()
+    assert manifest.is_file()
+
+
+@pytest.mark.parametrize(
+    "filename,heading",
+    [
+        ("README.md", "### profile: account info and daily download quota"),
+        ("README.zh-CN.md", "### profile：看账号信息和今日下载额度"),
+    ],
+)
+def test_readme_quota_examples_match_profile_contract(filename, heading):
+    content = (Path(cli.__file__).parent.parent / filename).read_text(encoding="utf-8")
+    profile_section = content.split(heading, 1)[1].split("### search", 1)[0]
+    example = json.loads(profile_section.split("```json\n", 1)[1].split("```", 1)[0])
+    actual = cli.parse_quota(example["user"])
+    assert set(example["quota"]) == set(actual)
+    for field in ("status", "used", "limit", "remaining"):
+        assert example["quota"][field] == actual[field]
+    cli.time.strptime(example["quota"]["checked_at"], "%Y-%m-%dT%H:%M:%SZ")
+
+
+@pytest.mark.parametrize("error_type", [httpx.ReadTimeout, httpx.ReadError])
+def test_transfer_failure_never_reacquires_link_or_switches_account(
+    cfg, monkeypatch, tmp_path, capsys, error_type
+):
+    save_review_accounts(cfg)
+    calls = []
+
+    class FailedTransfer(httpx.SyncByteStream):
+        def __iter__(self):
+            yield b"partial book"
+            raise error_type("TRANSFER_PRIVATE_MARKER")
+
+    def handler(request):
+        calls.append(request_identity(request))
+        if request.url.path == "/eapi/user/profile":
+            return httpx.Response(
+                200,
+                json={
+                    "success": 1,
+                    "user": {"downloads_today": 0, "downloads_limit": 5},
+                },
+            )
+        if request.url.path.endswith("/file"):
+            return httpx.Response(
+                200,
+                json={
+                    "success": 1,
+                    "file": {
+                        "downloadLink": cli.DEFAULT_BASE_URL + "/download",
+                        "extension": "epub",
+                    },
+                },
+            )
+        return httpx.Response(200, stream=FailedTransfer())
+
+    mock_network(monkeypatch, handler)
+    monkeypatch.setattr(
+        cli.sys,
+        "argv",
+        [
+            "zlibrary-tor",
+            "download",
+            "--id",
+            "123",
+            "--hash",
+            "abcdef",
+            "--output-dir",
+            str(tmp_path),
+            "--account",
+            "auto",
+        ],
+    )
+    assert cli.main() == 1
+    assert calls == [
+        (cli.DEFAULT_BASE_URL, "123", "/eapi/user/profile"),
+        (cli.DEFAULT_BASE_URL, "123", "/eapi/book/123/abcdef/file"),
+        (cli.DEFAULT_BASE_URL, "123", "/download"),
+    ]
+    output = capsys.readouterr().out
+    assert json.loads(output)["ok"] is False
+    assert "TRANSFER_PRIVATE_MARKER" not in output
+    assert not list(tmp_path.glob("*.lock"))
+    assert not list(tmp_path.glob(".zlib-*"))
+
+
+@pytest.mark.parametrize("command", ["doctor", "probe"])
+@pytest.mark.parametrize("success", [1, True])
+def test_health_checks_accept_only_supported_success_values(
+    cfg, monkeypatch, capsys, fake_proxy, command, success
+):
+    mock_network(monkeypatch, lambda _: httpx.Response(200, json={"success": success}))
+    if command == "doctor":
+        cli.cmd_doctor(cfg, None)
+        result = json.loads(capsys.readouterr().out)
+    else:
+        result = cli.probe_domain(cfg, cli.DEFAULT_BASE_URL)
+    assert result["api_compatible"] is True
+    assert result["ownership_verified"] is False
+
+
+def test_doctor_reports_missing_session_binding_locally(
+    cfg, monkeypatch, capsys, fake_proxy
+):
+    config = save_review_accounts(cfg, missing_origin=True)
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(200, json={"success": 1})
+
+    mock_network(monkeypatch, handler)
+    cli.cmd_doctor(config, None)
+    result = json.loads(capsys.readouterr().out)
+    assert result["authenticated"] is True
+    assert result["session_origin_match"] is False
+    assert result["session_origin"] is None
+    assert len(calls) == 1
+    assert "remix-userkey" not in calls[0].headers
+    assert "cookie" not in calls[0].headers
+
+
+@pytest.mark.parametrize("failure", ["503", "transport"])
+def test_doctor_keeps_bounded_health_retries_without_credentials(
+    cfg, monkeypatch, capsys, fake_proxy, failure
+):
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        if len(calls) == 1:
+            if failure == "503":
+                return httpx.Response(503, content=b"busy")
+            raise httpx.ConnectError("offline failure", request=request)
+        return httpx.Response(200, json={"success": 1})
+
+    mock_network(monkeypatch, handler)
+    cli.cmd_doctor(cfg, None)
+    assert json.loads(capsys.readouterr().out)["ok"] is True
+    assert len(calls) == 2
+    assert all(
+        r.url.path == "/eapi/info"
+        and "cookie" not in r.headers
+        and "remix-userkey" not in r.headers
+        for r in calls
+    )
+
+
+def test_environment_import_never_rebinds_session_to_trusted_backup(cfg, monkeypatch):
+    config = cli.load_config()
+    backup = f"http://{make_v3_onion(b'b' * 32)}"
+    config["base_url"] = backup
+    config["domains"]["backup"] = {
+        "url": backup,
+        "trust": "user_verified",
+        "source": "https://example.org/proof",
+        "verified_at": "2026-10-11T00:00:00Z",
+    }
+    cli.save_config(config)
+    before = cli.config_path().read_bytes()
+    monkeypatch.setenv("ZLIBRARY_REMIX_USERID", "original-id")
+    monkeypatch.setenv("ZLIBRARY_REMIX_USERKEY", "original-key")
+    monkeypatch.setenv("ZLIBRARY_SESSION_ORIGIN", cli.DEFAULT_BASE_URL)
+    monkeypatch.setattr(
+        cli, "client", lambda _: pytest.fail("mismatched import went online")
+    )
+    assert cli.is_trusted_origin(config, backup)
+    with pytest.raises(cli.CliError) as caught:
+        cli.cmd_import_session(cli.settings(), SimpleNamespace(account="imported"))
+    assert caught.value.reason == "session_origin_mismatch"
+    assert cli.config_path().read_bytes() == before
+
+
+def test_untrusted_legacy_raw_base_url_never_becomes_cache_alias(
+    cfg, monkeypatch, tmp_path
+):
+    raw_origin = f"HTTP://{make_v3_onion(b'r' * 32).upper()}:80"
+    config = cli.load_config()
+    config["legacy_base_urls"] = [raw_origin]
+    cli.save_config(config)
+    book = tmp_path / "foreign.epub"
+    book.write_bytes(b"foreign cached book")
+    key = hashlib.sha256(f"{raw_origin}\n123\nabcdef".encode()).hexdigest()
+    (tmp_path / f".zlib-{key}.json").write_text(
+        json.dumps(
+            {
+                "name": book.name,
+                "bytes": book.stat().st_size,
+                "sha256": cli.digest(book),
+            }
+        )
+    )
+    monkeypatch.setattr(cli, "client", lambda _: pytest.fail("cache miss went online"))
+    with pytest.raises(cli.CliError) as caught:
+        cli.cmd_download(cli.settings(), download_args(tmp_path, account="absent"))
+    assert caught.value.reason == "account_not_found"
+    assert not (tmp_path / f".zlib-{cli.cache_key('123', 'abcdef')}.json").exists()
+
+
+@pytest.mark.parametrize("default_alias", [None, "personal"])
+def test_login_without_alias_uses_current_default_or_creates_default(
+    cfg, monkeypatch, capsys, default_alias
+):
+    config = cli.load_config()
+    config["accounts"] = {"personal": config["accounts"]["default"]}
+    config["default_account"] = default_alias
+    cli.save_config(config)
+    monkeypatch.setenv("ZLIBRARY_PASSWORD", "offline-password")
+    mock_network(
+        monkeypatch,
+        lambda _: httpx.Response(
+            200,
+            json={"success": 1, "user": {"id": "new-id", "remix_userkey": "new-key"}},
+        ),
+    )
+    cli.cmd_login(
+        cli.settings(),
+        SimpleNamespace(
+            account=None, email="offline@example.org", stdin_password=False
+        ),
+    )
+    stored = cli.load_config()
+    target = default_alias or "default"
+    assert stored["default_account"] == target
+    assert stored["accounts"][target]["remix_userid"] == "new-id"
+    if default_alias is None:
+        assert stored["accounts"]["personal"] == config["accounts"]["personal"]
+    assert json.loads(capsys.readouterr().out)["account"] == target

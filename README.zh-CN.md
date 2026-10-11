@@ -80,9 +80,9 @@ python scripts/zlibrary_tor.py doctor
 python scripts/zlibrary_tor.py login --email you@example.com
 ```
 
-输密码时屏幕上不显示，密码也不会存到任何文件。存下来的只有会话凭证（`remix_userid` / `remix_userkey`）及原点绑定，默认放在 `~/.config/zlibrary-tor/config.json`，可以用环境变量 `ZLIBRARY_TOR_CONFIG` 换位置。可用 `--account NAME` 指定保存的账号别名（默认 `default`）。
+输密码时屏幕上不显示，密码也不会存到任何文件。存下来的只有会话凭证（`remix_userid` / `remix_userkey`）及原点绑定，默认放在 `~/.config/zlibrary-tor/config.json`，可以用环境变量 `ZLIBRARY_TOR_CONFIG` 换位置。可用 `--account NAME` 指定保存的账号别名；省略时覆盖当前默认账号的会话，没有默认账号时才保存到 `default` 并将其设为默认。
 
-如果你已经在 Tor Browser 里登录过 Z-Library，不想再输一遍密码，用 `import-session`（可选 `--account NAME`）把浏览器里的那两个 remix 值粘进来就行。
+如果你已经在 Tor Browser 里登录过 Z-Library，不想再输一遍密码，用 `import-session`（可选 `--account NAME`）把浏览器里的那两个 remix 值粘进来就行。环境导入必须同时提供 `ZLIBRARY_REMIX_USERID`、`ZLIBRARY_REMIX_USERKEY` 和 `ZLIBRARY_SESSION_ORIGIN`，原点须与当前可信目标匹配；半组环境输入会直接拒绝，不与交互输入混合。
 
 ### profile：看账号信息和今日下载额度
 
@@ -104,9 +104,10 @@ python scripts/zlibrary_tor.py profile --account NAME
   "account": "default",
   "quota": {
     "status": "available",
-    "downloads_today": 0,
-    "downloads_limit": 10,
-    "remaining": 10
+    "used": 0,
+    "limit": 10,
+    "remaining": 10,
+    "checked_at": "2026-10-11T00:00:00Z"
   }
 }
 ```
@@ -159,7 +160,9 @@ python scripts/zlibrary_tor.py download --id 26610712 --hash def1ec --account au
 }
 ```
 
-`--output-dir` 指定保存目录（默认 `downloads`），`--max-mb` 限大小（默认 80 MB，最大 512）。`--account auto` 在请求下载链接前评估各账号确认的剩余配额，若配额耗尽或未知则立即停止，传输途中不换账号、不重试。`--force` 明确允许重新获取并替换缓存，但不可与 `--account auto` 混用。
+`--output-dir` 指定保存目录（默认 `downloads`），`--max-mb` 限大小（默认 80 MB，最大 512）。`--account auto` 在请求下载链接前评估各账号确认的剩余配额：候选额度耗尽时继续预检下一候选，配额未知或遇到限流则停止选择。一旦开始申请链接，失败即停止本次下载，不重试、不换账号或原点。`--force` 明确允许重新获取并替换缓存，但不可与 `--account auto` 混用。
+
+协调锁只覆盖本机使用同一配置文件的下载，不协调浏览器下载、其他配置文件或其他机器；profile 配额查询不会预留额度。升级前请停止旧版本下载进程，以免它们绕过新锁。
 
 正常用法是你从搜索结果里挑一本，agent 拿它对应的 `id` 和 `hash` 去下载。
 

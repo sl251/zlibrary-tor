@@ -57,10 +57,10 @@ class CliError(RuntimeError):
         self.status_code = status_code
 
 
-def secret(prompt: str, env: str, *, stdin: bool = False) -> str:
+def secret(prompt: str, env: str | None, *, stdin: bool = False) -> str:
     if stdin:
         value = sys.stdin.readline().rstrip("\r\n")
-    elif os.environ.get(env):
+    elif env and os.environ.get(env):
         value = os.environ[env]
     else:
         if not sys.stdin.isatty():
@@ -272,89 +272,124 @@ def validate_account_name(name: str) -> None:
         )
 
 
-def normalize_config(raw: dict) -> dict:
+def validate_config_structure(raw: dict) -> None:
+    """Validate persisted field types before migration or normalization."""
     if not isinstance(raw, dict):
         raise CliError("invalid config file", reason="invalid_config")
-
-    cfg = dict(raw)
-    schema_version = cfg.get("schema_version")
-    if schema_version is not None:
-        if not isinstance(schema_version, int):
+    if "schema_version" in raw:
+        version = raw["schema_version"]
+        if type(version) is not int or version < 1:
             raise CliError("invalid config schema version", reason="invalid_config")
-        if schema_version > 2:
+        if version > 2:
             raise CliError(
-                "unsupported config schema version",
-                reason="unsupported_config_version",
+                "unsupported config schema version", reason="unsupported_config_version"
             )
-
-    if schema_version == 2:
-        accounts = cfg.get("accounts", {})
-        if not isinstance(accounts, dict):
-            raise CliError(
-                "accounts in config must be a dictionary", reason="invalid_config"
-            )
-        for name, acc in accounts.items():
+    for field in ("base_url", "proxy", "remix_userid", "remix_userkey"):
+        if field in raw and not isinstance(raw[field], str):
+            raise CliError("invalid config string field", reason="invalid_config")
+    if "timeout" in raw:
+        value = raw["timeout"]
+        if (
+            type(value) not in (int, float)
+            or not 1 <= value <= 600
+            or not math.isfinite(value)
+        ):
+            raise CliError("invalid config timeout", reason="invalid_config")
+    if "retries" in raw and (
+        type(raw["retries"]) is not int or not 0 <= raw["retries"] <= 2
+    ):
+        raise CliError("invalid config retries", reason="invalid_config")
+    accounts = raw.get("accounts", {})
+    if not isinstance(accounts, dict):
+        raise CliError("invalid config accounts", reason="invalid_config")
+    for name, acc in accounts.items():
+        try:
             validate_account_name(name)
-            if not isinstance(acc, dict):
-                raise CliError(
-                    f"account '{name}' must be a dictionary", reason="invalid_config"
-                )
-        default_acc = cfg.get("default_account")
-        if default_acc is not None and not isinstance(default_acc, str):
+        except CliError as exc:
             raise CliError(
-                "default_account must be a string or null", reason="invalid_config"
-            )
-        cfg.setdefault("accounts", {})
-        cfg.setdefault("base_url", DEFAULT_BASE_URL)
-        cfg.setdefault("proxy", DEFAULT_PROXY)
-        cfg.setdefault("timeout", 45)
-        cfg.setdefault("retries", 1)
-        cfg.setdefault("default_account", None)
-        cfg["domains"] = _normalize_domains(cfg)
-        return cfg
+                "invalid config account alias", reason="invalid_config"
+            ) from exc
+        if not isinstance(acc, dict):
+            raise CliError("invalid config account", reason="invalid_config")
+        for field in ("remix_userid", "remix_userkey", "session_origin"):
+            if field in acc and not isinstance(acc[field], str):
+                raise CliError("invalid config account field", reason="invalid_config")
+    default = raw.get("default_account")
+    if default is not None and (
+        not isinstance(default, str) or default not in accounts
+    ):
+        raise CliError("invalid config default account", reason="invalid_config")
+    legacy_urls = raw.get("legacy_base_urls", [])
+    if not isinstance(legacy_urls, list) or any(
+        not isinstance(u, str) for u in legacy_urls
+    ):
+        raise CliError("invalid config legacy origins", reason="invalid_config")
+    domains = raw.get("domains")
+    if domains is not None:
+        if not isinstance(domains, dict):
+            raise CliError("invalid config domains", reason="invalid_config")
+        for record in domains.values():
+            if not isinstance(record, dict):
+                raise CliError("invalid config domain", reason="invalid_config")
+            for field in ("url", "trust", "source", "verified_at"):
+                if (
+                    field in record
+                    and record[field] is not None
+                    and not isinstance(record[field], str)
+                ):
+                    raise CliError(
+                        "invalid config domain field", reason="invalid_config"
+                    )
+    try:
+        for url in [raw.get("base_url", DEFAULT_BASE_URL), *legacy_urls]:
+            normalize_origin(url)
+        for acc in accounts.values():
+            if acc.get("session_origin"):
+                normalize_origin(acc["session_origin"])
+    except (TypeError, ValueError) as exc:
+        raise CliError("invalid config origin", reason="invalid_config") from exc
 
-    # Legacy config (no schema_version or < 2)
-    if "base_url" in raw and not isinstance(raw["base_url"], str):
-        raise CliError("base_url must be a string", reason="invalid_config")
-    if "proxy" in raw and not isinstance(raw["proxy"], str):
-        raise CliError("proxy must be a string", reason="invalid_config")
-    if "timeout" in raw and not isinstance(raw["timeout"], (int, float)):
-        raise CliError("timeout must be numeric", reason="invalid_config")
-    if "retries" in raw and not isinstance(raw["retries"], int):
-        raise CliError("retries must be an integer", reason="invalid_config")
 
-    uid = cfg.pop("remix_userid", None)
-    key = cfg.pop("remix_userkey", None)
-    has_uid = bool(uid)
-    has_key = bool(key)
-    if has_uid != has_key:
-        raise CliError(
-            "incomplete session in legacy config", reason="incomplete_session"
-        )
-
-    cfg["schema_version"] = 2
+def normalize_config(raw: dict) -> dict:
+    validate_config_structure(raw)
+    cfg = dict(raw)
     cfg.setdefault("base_url", DEFAULT_BASE_URL)
     cfg.setdefault("proxy", DEFAULT_PROXY)
     cfg.setdefault("timeout", 45)
     cfg.setdefault("retries", 1)
+    cfg.setdefault("accounts", {})
+    cfg.setdefault("default_account", None)
 
-    accounts = (
-        dict(cfg.get("accounts", {})) if isinstance(cfg.get("accounts"), dict) else {}
-    )
-    default_acc = cfg.get("default_account")
+    # Preserve literal old cache identities across normalization and domain changes.
+    legacy_urls = list(cfg.get("legacy_base_urls", []))
+    if (
+        cfg["base_url"] != normalize_origin(cfg["base_url"])
+        and cfg["base_url"] not in legacy_urls
+    ):
+        legacy_urls.append(cfg["base_url"])
+    if legacy_urls:
+        cfg["legacy_base_urls"] = legacy_urls
 
-    if has_uid and has_key:
-        origin_val = normalize_origin(raw.get("base_url") or DEFAULT_BASE_URL)
-        accounts["default"] = {
-            "remix_userid": str(uid),
-            "remix_userkey": str(key),
-            "session_origin": origin_val,
-        }
-        default_acc = "default"
-
-    cfg["accounts"] = accounts
-    cfg["default_account"] = default_acc
-    cfg["domains"] = _normalize_domains(cfg)
+    if cfg.get("schema_version") != 2:
+        uid = cfg.pop("remix_userid", None)
+        key = cfg.pop("remix_userkey", None)
+        if bool(uid) != bool(key):
+            raise CliError(
+                "incomplete session in legacy config", reason="incomplete_session"
+            )
+        cfg["schema_version"] = 2
+        cfg["accounts"] = dict(cfg["accounts"])
+        if uid and key:
+            cfg["accounts"]["default"] = {
+                "remix_userid": uid,
+                "remix_userkey": key,
+                "session_origin": normalize_origin(cfg["base_url"]),
+            }
+            cfg["default_account"] = "default"
+    try:
+        cfg["domains"] = _normalize_domains(cfg)
+    except (TypeError, ValueError) as exc:
+        raise CliError("invalid config domain origin", reason="invalid_config") from exc
     return cfg
 
 
@@ -378,6 +413,7 @@ def load_config() -> dict:
     if not isinstance(data, dict):
         raise CliError("invalid config file", reason="invalid_config")
 
+    validate_config_structure(data)
     # If legacy config needs migration and file exists, persist it under lock
     if "schema_version" not in data or data["schema_version"] < 2:
         lock_path = path.parent / (path.name + ".lock")
@@ -507,19 +543,26 @@ def validate_target(url: str, *, allow_http_onion: bool = False) -> None:
         raise CliError("refusing a private/reserved IP target")
 
 
+def session_origin_matches(bound_origin: str | None, current_origin: str) -> bool:
+    if not bound_origin:
+        return False
+    try:
+        return normalize_origin(bound_origin) == normalize_origin(current_origin)
+    except (TypeError, ValueError):
+        return False
+
+
 def auth(cfg: dict) -> tuple[dict, dict]:
-    uid = str(cfg.get("remix_userid", ""))
-    key = str(cfg.get("remix_userkey", ""))
+    uid = str(cfg.get("remix_userid") or "")
+    key = str(cfg.get("remix_userkey") or "")
     if not uid or not key:
         return {}, {}
-    require_trusted_origin(cfg)
-    origin_val = str(cfg.get("session_origin") or "")
-    if origin_val and normalize_origin(origin_val) != normalize_origin(
-        cfg.get("base_url", "")
-    ):
+    origin_val = cfg.get("session_origin")
+    if not session_origin_matches(origin_val, cfg.get("base_url", "")):
         raise CliError(
             "session origin does not match base URL", reason="session_origin_mismatch"
         )
+    require_trusted_origin(cfg)
     headers = {"remix-userid": uid, "remix-userkey": key}
     cookies = {
         "remix_userid": uid,
@@ -576,6 +619,12 @@ def request_json(
         raise CliError("no response received", reason="network_error")
     if response.status_code in REDIRECTS:
         raise CliError(f"unexpected API redirect (HTTP {response.status_code})")
+    if response.status_code == 401:
+        raise CliError("API HTTP 401", reason="session_invalid", status_code=401)
+    if response.status_code == 429:
+        raise CliError("API HTTP 429", reason="rate_limited", status_code=429)
+    if response.status_code == 403:
+        raise CliError("API HTTP 403", reason="profile_failed", status_code=403)
     try:
         payload = response.json()
     except ValueError as exc:
@@ -587,12 +636,6 @@ def request_json(
         raise CliError(
             "API returned a non-object JSON response", reason="invalid_response"
         )
-    if response.status_code == 401:
-        raise CliError("API HTTP 401", reason="session_invalid", status_code=401)
-    if response.status_code == 429:
-        raise CliError("API HTTP 429", reason="rate_limited", status_code=429)
-    if response.status_code == 403:
-        raise CliError("API HTTP 403", reason="profile_failed", status_code=403)
     if response.status_code >= 400:
         raise CliError(
             f"API HTTP {response.status_code}",
@@ -653,7 +696,11 @@ def parse_quota(user: dict | None) -> dict:
 
 
 def resolve_account(
-    cfg: dict, account_name: str | None, *, require: bool = False
+    cfg: dict,
+    account_name: str | None,
+    *,
+    require: bool = False,
+    check_origin: bool = True,
 ) -> tuple[str | None, dict | None]:
     # 1. Explicit account name
     if account_name is not None:
@@ -673,12 +720,12 @@ def resolve_account(
                     reason="account_required",
                 )
             origin_val = os.environ.get("ZLIBRARY_SESSION_ORIGIN", "")
-            if not origin_val:
+            if check_origin and not origin_val:
                 raise CliError(
                     "environment session requires ZLIBRARY_SESSION_ORIGIN",
                     reason="session_origin_missing",
                 )
-            if normalize_origin(origin_val) != normalize_origin(cfg["base_url"]):
+            if check_origin and not session_origin_matches(origin_val, cfg["base_url"]):
                 raise CliError(
                     "session origin does not match base URL",
                     reason="session_origin_mismatch",
@@ -710,12 +757,12 @@ def resolve_account(
                 )
             return account_name, None
         origin_val = str(acc.get("session_origin") or "")
-        if not origin_val:
+        if check_origin and not origin_val:
             raise CliError(
                 "account has no bound session origin",
                 reason="session_origin_missing",
             )
-        if normalize_origin(origin_val) != normalize_origin(cfg["base_url"]):
+        if check_origin and not session_origin_matches(origin_val, cfg["base_url"]):
             raise CliError(
                 "session origin does not match base URL",
                 reason="session_origin_mismatch",
@@ -734,12 +781,12 @@ def resolve_account(
         )
     if has_uid and has_key:
         origin_val = os.environ.get("ZLIBRARY_SESSION_ORIGIN", "")
-        if not origin_val:
+        if check_origin and not origin_val:
             raise CliError(
                 "environment session requires ZLIBRARY_SESSION_ORIGIN",
                 reason="session_origin_missing",
             )
-        if normalize_origin(origin_val) != normalize_origin(cfg["base_url"]):
+        if check_origin and not session_origin_matches(origin_val, cfg["base_url"]):
             raise CliError(
                 "session origin does not match base URL",
                 reason="session_origin_mismatch",
@@ -759,12 +806,14 @@ def resolve_account(
             key = str(acc.get("remix_userkey") or "")
             if uid and key:
                 origin_val = str(acc.get("session_origin") or "")
-                if not origin_val:
+                if check_origin and not origin_val:
                     raise CliError(
                         "account has no bound session origin",
                         reason="session_origin_missing",
                     )
-                if normalize_origin(origin_val) != normalize_origin(cfg["base_url"]):
+                if check_origin and not session_origin_matches(
+                    origin_val, cfg["base_url"]
+                ):
                     raise CliError(
                         "session origin does not match base URL",
                         reason="session_origin_mismatch",
@@ -776,26 +825,20 @@ def resolve_account(
                     reason="account_required",
                 )
 
-    # 4. Fallback for test fixture setting remix_userid/key directly on cfg:
-    cfg_uid = str(cfg.get("remix_userid") or "")
-    cfg_key = str(cfg.get("remix_userkey") or "")
-    if cfg_uid and cfg_key:
-        origin_val = str(
-            cfg.get("session_origin")
-            or normalize_origin(cfg.get("base_url", DEFAULT_BASE_URL))
-        )
-        return cfg.get("_account_name") or "default", {
-            "remix_userid": cfg_uid,
-            "remix_userkey": cfg_key,
-            "session_origin": origin_val,
-        }
-
     if require:
         raise CliError(
             "authentication requires an account; run login or import-session",
             reason="account_required",
         )
     return None, None
+
+
+def account_settings(cfg: dict, name: str | None, account: dict | None) -> dict:
+    snapshot = dict(cfg)
+    for field in ("remix_userid", "remix_userkey", "session_origin"):
+        snapshot[field] = (account or {}).get(field, "")
+    snapshot["_account_name"] = name
+    return snapshot
 
 
 def select_download_account(cfg: dict) -> tuple[str, dict]:
@@ -838,11 +881,7 @@ def select_download_account(cfg: dict) -> tuple[str, dict]:
         )
 
     for name, acc in candidates:
-        acc_cfg = dict(cfg)
-        acc_cfg["remix_userid"] = acc["remix_userid"]
-        acc_cfg["remix_userkey"] = acc["remix_userkey"]
-        acc_cfg["session_origin"] = acc["session_origin"]
-        acc_cfg["_account_name"] = name
+        acc_cfg = account_settings(cfg, name, acc)
 
         try:
             profile_payload = fetch_profile(acc_cfg)
@@ -898,8 +937,21 @@ def emit(value: object) -> None:
     print(json.dumps(value, ensure_ascii=False, indent=2))
 
 
-def probe_domain(cfg: dict, target_url: str) -> dict:
-    norm_url = validate_onion_origin(target_url)
+def request_health(cfg: dict, target_url: str, *, retryable: bool = False) -> dict:
+    attempts = 1 + (cfg.get("retries", 1) if retryable else 0)
+    for attempt in range(attempts):
+        try:
+            return _read_health_response(cfg, target_url)
+        except CliError as exc:
+            if attempt + 1 == attempts or (
+                exc.reason != "network_error" and exc.status_code not in {502, 503, 504}
+            ):
+                raise
+        time.sleep(0.5 * 2**attempt)
+    raise CliError("no health response received", reason="network_error")
+
+
+def _read_health_response(cfg: dict, target_url: str) -> dict:
     probe_cfg = {
         "proxy": cfg.get("proxy", DEFAULT_PROXY),
         "timeout": cfg.get("timeout", 45.0),
@@ -909,7 +961,7 @@ def probe_domain(cfg: dict, target_url: str) -> dict:
         with client(probe_cfg) as session:
             with session.stream(
                 "GET",
-                norm_url + "/eapi/info",
+                target_url + "/eapi/info",
                 headers=HEADERS,
             ) as response:
                 if response.status_code in REDIRECTS:
@@ -949,12 +1001,19 @@ def probe_domain(cfg: dict, target_url: str) -> dict:
         )
 
     success_val = payload.get("success")
-    if success_val not in (1, True):
+    if not (success_val is True or (type(success_val) is int and success_val == 1)):
         raise CliError(
             "API returned unsuccessful response",
             reason="api_failed",
             stage="api_response",
         )
+
+    return payload
+
+
+def probe_domain(cfg: dict, target_url: str) -> dict:
+    norm_url = validate_onion_origin(target_url)
+    request_health(cfg, norm_url)
 
     domains = cfg.get("domains", {})
     trust_status = "unverified"
@@ -984,12 +1043,16 @@ def cmd_doctor(cfg: dict, args) -> None:
             reason="invalid_arguments",
         )
     if account_arg:
-        acc_name, acc_data = resolve_account(cfg, account_arg, require=True)
+        acc_name, acc_data = resolve_account(
+            cfg, account_arg, require=True, check_origin=False
+        )
         authenticated = bool(
             acc_data and acc_data.get("remix_userid") and acc_data.get("remix_userkey")
         )
     else:
-        acc_name, acc_data = resolve_account(cfg, None, require=False)
+        acc_name, acc_data = resolve_account(
+            cfg, None, require=False, check_origin=False
+        )
         authenticated = bool(
             acc_data and acc_data.get("remix_userid") and acc_data.get("remix_userkey")
         )
@@ -1008,9 +1071,7 @@ def cmd_doctor(cfg: dict, args) -> None:
             stage="local_proxy",
         ) from exc
     try:
-        payload = request_json(
-            cfg, "GET", "/eapi/info", retryable=True, authenticated=False
-        )
+        payload = request_health(cfg, cfg["base_url"], retryable=True)
     except CliError as exc:
         exc.stage = "api_response" if exc.reason != "network_error" else "onion_request"
         raise
@@ -1034,7 +1095,7 @@ def cmd_doctor(cfg: dict, args) -> None:
         "authenticated": authenticated,
         "api_success": payload.get("success"),
         "reachable": True,
-        "api_compatible": bool(payload.get("success") in (1, True)),
+        "api_compatible": True,
         "ownership_verified": False,
         "trust": trust_status,
     }
@@ -1043,10 +1104,10 @@ def cmd_doctor(cfg: dict, args) -> None:
     if acc_data and acc_data.get("session_origin"):
         sess_orig = acc_data["session_origin"]
         result["session_origin"] = sess_orig
-        result["session_origin_match"] = bool(normalize_origin(sess_orig) == norm_base)
+        result["session_origin_match"] = session_origin_matches(sess_orig, norm_base)
     else:
         result["session_origin"] = None
-        result["session_origin_match"] = None
+        result["session_origin_match"] = False if authenticated else None
     emit(result)
 
 
@@ -1090,8 +1151,18 @@ def cmd_import_session(cfg: dict, args) -> None:
     account_name = getattr(args, "account", None)
     if account_name:
         validate_account_name(account_name)
-    uid = secret("remix_userid: ", "ZLIBRARY_REMIX_USERID").strip()
-    key = secret("remix_userkey: ", "ZLIBRARY_REMIX_USERKEY").strip()
+    env_fields = (
+        "ZLIBRARY_REMIX_USERID",
+        "ZLIBRARY_REMIX_USERKEY",
+        "ZLIBRARY_SESSION_ORIGIN",
+    )
+    if any(field in os.environ for field in env_fields):
+        _, session = resolve_account(cfg, "env", require=True)
+        uid = session["remix_userid"].strip()
+        key = session["remix_userkey"].strip()
+    else:
+        uid = secret("remix_userid: ", None).strip()
+        key = secret("remix_userkey: ", None).strip()
     if not uid or not key:
         raise CliError("both session values are required")
 
@@ -1193,11 +1264,7 @@ def cmd_profile(cfg: dict, args) -> None:
             reason="invalid_arguments",
         )
     acc_name, acc_data = resolve_account(cfg, account_arg, require=True)
-    acc_cfg = dict(cfg)
-    acc_cfg["remix_userid"] = acc_data["remix_userid"]
-    acc_cfg["remix_userkey"] = acc_data["remix_userkey"]
-    acc_cfg["session_origin"] = acc_data["session_origin"]
-    acc_cfg["_account_name"] = acc_name
+    acc_cfg = account_settings(cfg, acc_name, acc_data)
 
     payload = fetch_profile(acc_cfg)
     redacted = redact_credentials(payload)
@@ -1237,15 +1304,7 @@ def cmd_search(cfg: dict, args) -> None:
     acc_name, acc_data = resolve_account(
         cfg, account_arg, require=(account_arg is not None)
     )
-    search_cfg = dict(cfg)
-    if acc_data:
-        search_cfg["remix_userid"] = acc_data["remix_userid"]
-        search_cfg["remix_userkey"] = acc_data["remix_userkey"]
-        search_cfg["session_origin"] = acc_data["session_origin"]
-        search_cfg["_account_name"] = acc_name
-    else:
-        search_cfg["remix_userid"] = ""
-        search_cfg["remix_userkey"] = ""
+    search_cfg = account_settings(cfg, acc_name, acc_data)
 
     data: dict[str, object] = {
         "message": args.query,
@@ -1307,11 +1366,7 @@ def cmd_accounts(cfg: dict, args) -> None:
             )
             quota_info = None
             if refresh and session_present:
-                acc_cfg = dict(cfg)
-                acc_cfg["remix_userid"] = acc["remix_userid"]
-                acc_cfg["remix_userkey"] = acc["remix_userkey"]
-                acc_cfg["session_origin"] = acc.get("session_origin", "")
-                acc_cfg["_account_name"] = name
+                acc_cfg = account_settings(cfg, name, acc)
                 try:
                     profile_payload = fetch_profile(acc_cfg)
                     user = (
@@ -1397,6 +1452,51 @@ def cmd_accounts(cfg: dict, args) -> None:
         )
 
 
+def validate_verification_source(url: str) -> None:
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname or ""
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not host
+            or parsed.username is not None
+            or parsed.password is not None
+            or "@" in parsed.netloc
+            or "?" in url
+            or "#" in url
+        ):
+            raise ValueError
+        # Reuse public target restrictions; sources may also use public HTTP.
+        public_host = f"[{host}]" if ":" in host else host.rstrip(".")
+        validate_target(parsed._replace(scheme="https", netloc=public_host).geturl())
+        parsed.port  # Reject malformed/out-of-range ports.
+        if not host.endswith(".onion"):
+            try:
+                address = ipaddress.ip_address(host)
+            except ValueError:
+                labels = host.rstrip(".").encode("idna").decode("ascii").split(".")
+                if (
+                    len(labels) < 2
+                    or len(host) > 253
+                    or labels[-1].isdigit()
+                    or any(
+                        not re.fullmatch(
+                            r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label
+                        )
+                        for label in labels
+                    )
+                ):
+                    raise ValueError
+            else:
+                if address.is_multicast:
+                    raise ValueError
+    except (CliError, ValueError, UnicodeError) as exc:
+        raise CliError(
+            "source must be a public HTTP(S) URL without credentials, query or fragment",
+            reason="invalid_source",
+        ) from exc
+
+
 def cmd_domains(cfg: dict, args) -> None:
     sub = getattr(args, "domains_command", None)
     if sub == "list":
@@ -1449,37 +1549,30 @@ def cmd_domains(cfg: dict, args) -> None:
             raise CliError(
                 "verified-from source URL required", reason="source_required"
             )
-        parsed_src = urlparse(verified_from)
-        if (
-            parsed_src.username is not None
-            or parsed_src.password is not None
-            or "@" in parsed_src.netloc
-        ):
-            raise CliError(
-                "source URL must not contain credentials", reason="invalid_source"
-            )
-        if parsed_src.scheme not in {"http", "https"}:
-            raise CliError(
-                "source URL must use http:// or https://", reason="invalid_source"
-            )
+        validate_verification_source(verified_from)
 
         now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
         def updater(stored: dict) -> None:
             domains = stored.setdefault("domains", {})
-            if name in domains:
+            if name in domains and normalize_origin(domains[name]["url"]) != norm_url:
+                raise CliError("domain alias already exists", reason="domain_exists")
+            duplicates = [
+                existing_name
+                for existing_name, d in domains.items()
+                if normalize_origin(d["url"]) == norm_url
+            ]
+            if any(
+                domains[n].get("trust")
+                not in {"legacy_unverified", "custom", "unverified"}
+                for n in duplicates
+            ):
                 raise CliError(
-                    f"domain alias '{name}' already exists", reason="domain_exists"
+                    "trusted origin already registered", reason="domain_exists"
                 )
-            for existing_name, d in domains.items():
-                if (
-                    isinstance(d, dict)
-                    and normalize_origin(d.get("url", "")) == norm_url
-                ):
-                    raise CliError(
-                        f"origin already registered under alias '{existing_name}'",
-                        reason="domain_exists",
-                    )
+            for existing_name in duplicates:
+                if existing_name != name:
+                    del domains[existing_name]
             domains[name] = {
                 "url": norm_url,
                 "trust": "user_verified",
@@ -1646,16 +1739,7 @@ def digest(path: Path) -> str:
         return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
-def cache_key(*args, **kwargs) -> str:
-    if len(args) == 2 and isinstance(args[0], str) and isinstance(args[1], str):
-        book_id, book_hash = args[0], args[1]
-    elif len(args) >= 2 and hasattr(args[1], "id") and hasattr(args[1], "hash"):
-        book_id, book_hash = str(args[1].id), str(args[1].hash)
-    elif len(args) >= 1 and hasattr(args[0], "id") and hasattr(args[0], "hash"):
-        book_id, book_hash = str(args[0].id), str(args[0].hash)
-    else:
-        book_id = str(kwargs.get("id") or "")
-        book_hash = str(kwargs.get("hash") or "")
+def cache_key(book_id: str, book_hash: str) -> str:
     return hashlib.sha256(f"zlibrary\n{book_id}\n{book_hash}".encode()).hexdigest()
 
 
@@ -1672,6 +1756,10 @@ def legacy_cache_keys(cfg: dict, book_id: str, book_hash: str) -> list[str]:
     else:
         trusted_origins.append(DEFAULT_BASE_URL)
         trusted_origins.append(normalize_origin(DEFAULT_BASE_URL))
+
+    for raw_url in [cfg.get("base_url", ""), *cfg.get("legacy_base_urls", [])]:
+        if raw_url and is_trusted_origin(cfg, raw_url):
+            trusted_origins.append(raw_url)
 
     seen = set()
     keys = []
@@ -1710,6 +1798,7 @@ def cached_file(manifest: Path, output_dir: Path, max_bytes: int) -> Path | None
 def find_cached_download(
     cfg: dict, args, output_dir: Path, max_bytes: int
 ) -> Path | None:
+    require_trusted_origin(cfg)
     new_k = cache_key(args.id, args.hash)
     new_manifest = output_dir / f".zlib-{new_k}.json"
     cached = cached_file(new_manifest, output_dir, max_bytes)
@@ -1792,11 +1881,7 @@ def cmd_download(cfg: dict, args) -> None:
                 )
                 selection_mode = "explicit" if account_arg else "default"
 
-            download_cfg = dict(active_cfg)
-            download_cfg["remix_userid"] = acc_data["remix_userid"]
-            download_cfg["remix_userkey"] = acc_data["remix_userkey"]
-            download_cfg["session_origin"] = acc_data["session_origin"]
-            download_cfg["_account_name"] = acc_name
+            download_cfg = account_settings(active_cfg, acc_name, acc_data)
 
             download_locked(
                 download_cfg,
