@@ -68,7 +68,7 @@ After that, just tell your agent "search Z-Library for The Three-Body Problem" a
 
 ## Commands
 
-Eight commands; operational results and errors are JSON (help remains text). `doctor` and `search` work without login; `profile` and `download` need one.
+CLI commands output operational results and errors as JSON (help remains text). `doctor` and `search` work without login; `profile` and `download` need an account.
 
 ### doctor: check that Tor and the API are reachable
 
@@ -82,14 +82,16 @@ python scripts/zlibrary_tor.py doctor
 python scripts/zlibrary_tor.py login --email you@example.com
 ```
 
-The password prompt hides input, and the password is never written anywhere. Only the session values (`remix_userid` / `remix_userkey`) are saved, to `~/.config/zlibrary-tor/config.json` by default; override the location with `ZLIBRARY_TOR_CONFIG`.
+The password prompt hides input, and the password is never written anywhere. Only the session values (`remix_userid` / `remix_userkey`) and origin binding are saved, to `~/.config/zlibrary-tor/config.json` by default; override the location with `ZLIBRARY_TOR_CONFIG`. Use `--account NAME` to save credentials under a specific alias (defaults to `default`).
 
-Already logged in via Tor Browser? Run `import-session` and paste the two remix values from the browser instead of typing your password again.
+Already logged in via Tor Browser? Run `import-session` (optionally `--account NAME`) and paste the two remix values from the browser instead of typing your password again.
 
 ### profile: account info and daily download quota
 
 ```bash
 python scripts/zlibrary_tor.py profile
+# Or check a specific account
+python scripts/zlibrary_tor.py profile --account NAME
 ```
 
 ```json
@@ -100,9 +102,18 @@ python scripts/zlibrary_tor.py profile
     "email": "you@example.com",
     "downloads_today": 0,
     "downloads_limit": 10
+  },
+  "account": "default",
+  "quota": {
+    "status": "available",
+    "downloads_today": 0,
+    "downloads_limit": 10,
+    "remaining": 10
   }
 }
 ```
+
+*(Note: Quota values shown are illustrative examples from API responses; actual limits and usage are determined dynamically by upstream responses.)*
 
 ### search: find books
 
@@ -135,17 +146,22 @@ python scripts/zlibrary_tor.py search "三体" --limit 5 --language chinese
 
 ```bash
 python scripts/zlibrary_tor.py download --id 26610712 --hash def1ec
+# Or specify an account
+python scripts/zlibrary_tor.py download --id 26610712 --hash def1ec --account personal
+# Or use pre-request quota check across configured accounts
+python scripts/zlibrary_tor.py download --id 26610712 --hash def1ec --account auto
 ```
 
 ```json
 {
   "ok": true,
+  "status": "downloaded",
   "path": "downloads/三体-<book-key>.epub",
   "bytes": 2598912
 }
 ```
 
-`--output-dir` sets the save directory (default `downloads`), `--max-mb` caps the size (default 80 MB, max 512).
+`--output-dir` sets the save directory (default `downloads`), `--max-mb` caps the size (default 80 MB, max 512). `--account auto` evaluates confirmed remaining quotas before requesting a download link, stopping immediately if quota is exhausted or unverified without retrying or switching mid-stream. `--force` explicitly replaces a cached file but cannot be combined with `--account auto`.
 
 The normal flow: you pick a book from the search results, and the agent downloads it using that book's `id` and `hash`.
 
@@ -157,9 +173,30 @@ Prefer registering manually in Tor Browser (there are CAPTCHAs and confirmation 
 
 ```bash
 python scripts/zlibrary_tor.py logout
+# Or log out a specific named account
+python scripts/zlibrary_tor.py logout --account personal
+# Or clear all account sessions while preserving aliases and network settings
+python scripts/zlibrary_tor.py logout --all
 ```
 
 This removes local credentials, preserves proxy settings, and reports whether environment credentials remain. It does not revoke the server session.
+
+### accounts: manage saved accounts
+
+```bash
+# List configured accounts and active selection
+python scripts/zlibrary_tor.py accounts list
+
+# Check live quota across accounts (single profile query per account)
+python scripts/zlibrary_tor.py accounts list --refresh
+
+# Switch default account
+python scripts/zlibrary_tor.py accounts use personal
+
+# Remove a saved account alias (zero network requests)
+python scripts/zlibrary_tor.py accounts remove old_account
+```
+
 
 ### Automation and reliable downloads
 
@@ -190,6 +227,7 @@ This installs the CLI, not the agent's skill discovery files.
 | `ZLIBRARY_TOR_TIMEOUT` | Per-request timeout in seconds (1–600) | `45` |
 | `ZLIBRARY_TOR_RETRIES` | Extra read-only attempts (0–2) | `1` |
 | `ZLIBRARY_BASE_URL` | Z-Library address | built-in onion address |
+| `ZLIBRARY_SESSION_ORIGIN` | Bound origin URL for environment sessions (`ZLIBRARY_REMIX_*`) | none (must match configured base URL) |
 
 ## Common pitfalls
 

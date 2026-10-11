@@ -66,7 +66,7 @@ python ~/.claude/skills/zlibrary-tor/scripts/zlibrary_tor.py doctor
 
 ## 命令
 
-一共 8 条，操作结果和错误输出 JSON（帮助信息仍为文本）。`doctor` 和 `search` 不用登录，`profile` 和 `download` 要先登录。
+操作结果和错误输出 JSON（帮助信息仍为文本）。`doctor` 和 `search` 不用登录，`profile` 和 `download` 需要账号。
 
 ### doctor：检查链路通不通
 
@@ -80,14 +80,16 @@ python scripts/zlibrary_tor.py doctor
 python scripts/zlibrary_tor.py login --email you@example.com
 ```
 
-输密码时屏幕上不显示，密码也不会存到任何文件。存下来的只有会话凭证（`remix_userid` / `remix_userkey`），默认放在 `~/.config/zlibrary-tor/config.json`，可以用环境变量 `ZLIBRARY_TOR_CONFIG` 换位置。
+输密码时屏幕上不显示，密码也不会存到任何文件。存下来的只有会话凭证（`remix_userid` / `remix_userkey`）及原点绑定，默认放在 `~/.config/zlibrary-tor/config.json`，可以用环境变量 `ZLIBRARY_TOR_CONFIG` 换位置。可用 `--account NAME` 指定保存的账号别名（默认 `default`）。
 
-如果你已经在 Tor Browser 里登录过 Z-Library，不想再输一遍密码，用 `import-session` 把浏览器里的那两个 remix 值粘进来就行。
+如果你已经在 Tor Browser 里登录过 Z-Library，不想再输一遍密码，用 `import-session`（可选 `--account NAME`）把浏览器里的那两个 remix 值粘进来就行。
 
 ### profile：看账号信息和今日下载额度
 
 ```bash
 python scripts/zlibrary_tor.py profile
+# 或查看指定账号
+python scripts/zlibrary_tor.py profile --account NAME
 ```
 
 ```json
@@ -98,9 +100,18 @@ python scripts/zlibrary_tor.py profile
     "email": "you@example.com",
     "downloads_today": 0,
     "downloads_limit": 10
+  },
+  "account": "default",
+  "quota": {
+    "status": "available",
+    "downloads_today": 0,
+    "downloads_limit": 10,
+    "remaining": 10
   }
 }
 ```
+
+*(注：配额数值为 API 响应示例，实际额度以服务端返回为准。)*
 
 ### search：搜书
 
@@ -133,17 +144,22 @@ python scripts/zlibrary_tor.py search "三体" --limit 5 --language chinese
 
 ```bash
 python scripts/zlibrary_tor.py download --id 26610712 --hash def1ec
+# 或指定账号
+python scripts/zlibrary_tor.py download --id 26610712 --hash def1ec --account personal
+# 或使用配额预检自动选择可用账号
+python scripts/zlibrary_tor.py download --id 26610712 --hash def1ec --account auto
 ```
 
 ```json
 {
   "ok": true,
+  "status": "downloaded",
   "path": "downloads/三体-<book-key>.epub",
   "bytes": 2598912
 }
 ```
 
-`--output-dir` 指定保存目录（默认 `downloads`），`--max-mb` 限大小（默认 80 MB，最大 512）。
+`--output-dir` 指定保存目录（默认 `downloads`），`--max-mb` 限大小（默认 80 MB，最大 512）。`--account auto` 在请求下载链接前评估各账号确认的剩余配额，若配额耗尽或未知则立即停止，传输途中不换账号、不重试。`--force` 明确允许重新获取并替换缓存，但不可与 `--account auto` 混用。
 
 正常用法是你从搜索结果里挑一本，agent 拿它对应的 `id` 和 `hash` 去下载。
 
@@ -155,9 +171,30 @@ python scripts/zlibrary_tor.py download --id 26610712 --hash def1ec
 
 ```bash
 python scripts/zlibrary_tor.py logout
+# 或清除指定别名的会话
+python scripts/zlibrary_tor.py logout --account personal
+# 或清除全部账号会话（保留别名与网络配置）
+python scripts/zlibrary_tor.py logout --all
 ```
 
 保留代理等配置，只删除已保存的会话。不会撤销服务器令牌，也无法清除父进程的环境变量；结果会提示是否仍有环境会话。
+
+### accounts：管理已保存账号
+
+```bash
+# 列出已保存账号及当前选中
+python scripts/zlibrary_tor.py accounts list
+
+# 刷新并检查各账号实时配额（每个账号单次 profile 查询）
+python scripts/zlibrary_tor.py accounts list --refresh
+
+# 切换默认账号
+python scripts/zlibrary_tor.py accounts use personal
+
+# 移除已保存账号别名（纯本地操作，零网络）
+python scripts/zlibrary_tor.py accounts remove old_account
+```
+
 
 ### 自动化与可靠下载
 
@@ -188,6 +225,7 @@ uvx --from git+https://github.com/sl251/zlibrary-tor.git zlibrary-tor doctor
 | `ZLIBRARY_TOR_TIMEOUT` | 每次请求超时秒数（1–600） | `45` |
 | `ZLIBRARY_TOR_RETRIES` | 只读操作额外重试次数（0–2） | `1` |
 | `ZLIBRARY_BASE_URL` | Z-Library 地址 | 内置 onion 地址 |
+| `ZLIBRARY_SESSION_ORIGIN` | 环境变量会话（`ZLIBRARY_REMIX_*`）绑定的原点 URL | 无（必须与配置基准 URL 严格匹配） |
 
 ## 常见坑
 

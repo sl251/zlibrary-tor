@@ -21,13 +21,23 @@ Use `scripts/zlibrary_tor.py` as the deterministic interface. It emits JSON for 
 
 - Inspect JSON `reason` and optional `stage`, as well as the exit code. `doctor` distinguishes `local_proxy`, `onion_request`, and `api_response`; a reachable TCP port alone does not prove Tor bootstrap or SOCKS negotiation succeeded.
 - Only health checks and searches automatically retry transport failures or HTTP 502/503/504. `ZLIBRARY_TOR_TIMEOUT` sets each request's timeout (1–600 seconds); `ZLIBRARY_TOR_RETRIES` sets extra attempts (0–2, default 1). These are not a total wall-clock deadline.
-- Never automatically retry login, registration, or acquiring a download link. Stop on `daily_quota_exhausted`; unknown download errors are not proof of exhausted quota. Do not rotate accounts or mirrors to evade limits.
+- Never automatically retry login, registration, or acquiring a download link. Stop the current download on `daily_quota_exhausted`; unknown download errors are not proof of exhausted quota. Multiple accounts may be managed only when the user legitimately controls them and the service permits the intended use. Explicit quota-based selection may occur only before any download-link request, using confirmed quota information. Do not rotate accounts or mirrors to evade limits, retry a failed link request through another identity or host, or repeatedly request the same book across accounts.
 - Downloads use unique `.part` files and replace the destination only after a successful stream and available length checks. Normal failures remove temporary files. A killed process may leave a `.part` or `.lock`; remove it only after confirming the process is no longer active. No resume support is claimed.
 - `logout` removes saved session values locally; it does not revoke sessions on the server or clear the parent process's environment.
 
 The default configuration is `~/.config/zlibrary-tor/config.json` (or `%APPDATA%/zlibrary-tor/config.json` on Windows). Override it with `ZLIBRARY_TOR_CONFIG`. The default proxy is `socks5://127.0.0.1:9050`; override it with `ZLIBRARY_TOR_PROXY`.
 
 On restricted networks, the configured proxy must still be a Tor SOCKS listener. If Tor itself needs a conventional upstream proxy, configure Tor with `HTTPSProxy proxy-host:port` or `Socks5Proxy proxy-host:port`, matching the user's actual proxy protocol. Do not point this skill directly at a conventional proxy and assume it can resolve onion services.
+
+## Account selection and verification
+
+- `--account auto` is an explicit pre-request selection mechanism evaluated before any download link is requested.
+- Stop immediately when quota fields are unknown or unverified; do not guess remaining limits or assume quota exhaustion.
+- Never rotate accounts or switch hosts once a download link request has begun.
+- Candidate health checks never convey trust or authorize sending credentials.
+- Add domains or accounts only after human verification of the official source.
+- Switching domains never migrates or forwards active session tokens.
+
 
 ## Account creation
 
