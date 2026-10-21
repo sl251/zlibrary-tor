@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=77"]
+requires = ["setuptools>=83.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -9,7 +9,7 @@ description = "JSON CLI and agent skill for the Z-Library E-API through Tor"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
-dependencies = ["httpx[socks]>=0.28.1,<1"]
+dependencies = ["httpx[socks]>=0.28.1,<1", "certifi>=2026.10.19"]
 
 [project.scripts]
 zlibrary-tor = "zlibrary_tor:main"
